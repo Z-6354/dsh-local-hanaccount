@@ -1,5 +1,5 @@
 {
-  "name": "dsh-loacal-hanaccount",
+  "name": "dsh-local-hanaccount",
   "version": "0.1.0",
   "description": "A DeepSeek Harness (DSH) plugin scaffold for a local Han account profile.",
   "type": "module",
@@ -35,12 +35,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Z-6354/dsh-loacal-hanaccount.git"
+    "url": "git+https://github.com/Z-6354/dsh-local-hanaccount.git"
   },
   "bugs": {
-    "url": "https://github.com/Z-6354/dsh-loacal-hanaccount/issues"
+    "url": "https://github.com/Z-6354/dsh-local-hanaccount/issues"
   },
-  "homepage": "https://github.com/Z-6354/dsh-loacal-hanaccount#readme",
+  "homepage": "https://github.com/Z-6354/dsh-local-hanaccount#readme",
   "publishConfig": {
     "access": "public"
   },

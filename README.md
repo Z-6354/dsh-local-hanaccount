@@ -1,13 +1,11 @@
-# dsh-loacal-hanaccount
+# dsh-local-hanaccount
 
 A small DeepSeek Harness (DSH) / Cordis plugin package for a local Han account profile.
-
-> Note: the package name intentionally follows the requested spelling: `dsh-loacal-hanaccount`.
 
 ## Install
 
 ```bash
-npm install dsh-loacal-hanaccount
+npm install dsh-local-hanaccount
 ```
 
 ## Usage
@@ -15,7 +13,7 @@ npm install dsh-loacal-hanaccount
 Add the plugin to your DSH/Cordis plugin configuration as you would any other DSH plugin package.
 
 ```ts
-import * as hanAccount from 'dsh-loacal-hanaccount';
+import * as hanAccount from 'dsh-local-hanaccount';
 
 // Cordis-style loading example:
 ctx.plugin(hanAccount, {

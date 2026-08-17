@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
 
 /** Cordis plugin name used by the DSH loader. */
-export const name = 'loacal-hanaccount';
+export const name = 'local-hanaccount';
 
 /** Configuration for the local Han account plugin. */
 export interface Config {
