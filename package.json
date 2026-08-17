@@ -1,0 +1,57 @@
+{
+  "name": "dsh-loacal-hanaccount",
+  "version": "0.1.0",
+  "description": "A DeepSeek Harness (DSH) plugin scaffold for a local Han account profile.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "clean": "rm -rf lib",
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run build",
+    "test": "npm run build"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "hanaccount"
+  ],
+  "author": "han0423",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Z-6354/dsh-loacal-hanaccount.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Z-6354/dsh-loacal-hanaccount/issues"
+  },
+  "homepage": "https://github.com/Z-6354/dsh-loacal-hanaccount#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "typescript": "^5.9.2"
+  }
+}
