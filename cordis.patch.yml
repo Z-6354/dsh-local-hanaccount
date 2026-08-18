@@ -1,0 +1,21 @@
+# dsh-local-hanaccount bundle patch.
+#
+# Users are intentionally configured locally; this plugin does NOT implement
+# self-registration in v0.1. Override this row from the profile/home patch and
+# provide your own users.
+- insert:
+    - id: dsh-local-hanaccount
+      name: dsh-local-hanaccount
+      config:
+        enabled: true
+        rememberLogin: true
+        dataDir: ""
+        users: []
+        # Example override:
+        # users:
+        #   - username: admin
+        #     password: admin123
+        #     role: admin
+        #   - username: user1
+        #     password: user123
+        #     role: user
