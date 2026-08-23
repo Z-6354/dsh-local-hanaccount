@@ -1,391 +1,337 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { _internals } from '../src/index.js'
+import { createStore } from '../src/lib/store.js'
+import { evaluateIpAccess, ipInList, ipMatchesEntry, resolveClientIp, detectNginxMisconfig, requestHost } from '../src/lib/ip.js'
+import { getPasskeyContext, passkeyStatus } from '../src/lib/passkey-context.js'
+import { hashPassword, verifyPassword, checkLockout, recordFailedAttempt } from '../src/lib/password.js'
+import { createVisitorsStore } from '../src/lib/visitors.js'
+import { createGate, wrapWebServer } from '../src/gate.js'
+import { isAuthExcluded, shouldWrapPrefix } from '../src/lib/route-policy.js'
+import { createTokenStore } from '../src/lib/tokens.js'
+import { createPeersStore } from '../src/lib/peers.js'
+import { installOutboundFetch } from '../src/lib/outbound-fetch.js'
 
-test('ordinary user workspace is forced under account root', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
+test('password hash and verify', () => {
+  const hash = hashPassword('secret-pass')
+  assert.ok(hash.startsWith('$scrypt$'))
+  assert.equal(verifyPassword('secret-pass', hash), true)
+  assert.equal(verifyPassword('wrong', hash), false)
+})
+
+test('ip whitelist and blacklist evaluation', () => {
+  const cfg = { ipLimitEnabled: true, allow: ['127.0.0.1'], deny: ['10.0.0.1'] }
+  assert.equal(evaluateIpAccess('10.0.0.1', cfg).action, 'block')
+  assert.equal(evaluateIpAccess('10.0.0.1', cfg).reason, 'ip_blacklisted')
+  assert.equal(evaluateIpAccess('127.0.0.1', cfg).action, 'pass')
+  assert.equal(evaluateIpAccess('203.0.113.50', cfg).action, 'block')
+  assert.equal(evaluateIpAccess('203.0.113.50', { ...cfg, ipLimitEnabled: false }).action, 'pass')
+})
+
+test('cidr matching', () => {
+  assert.equal(ipMatchesEntry('192.168.1.10', '192.168.1.0/24'), true)
+  assert.equal(ipMatchesEntry('192.168.2.10', '192.168.1.0/24'), false)
+  assert.ok(ipInList('192.168.1.5', ['192.168.0.0/16']))
+})
+
+test('resolve client ip ignores forwarded headers on direct connection', () => {
+  const req = {
+    socket: { remoteAddress: '203.0.113.9' },
+    headers: { 'x-real-ip': '127.0.0.1' },
+  }
+  assert.equal(resolveClientIp(req, { trustProxy: true }), '203.0.113.9')
+  const proxied = {
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { 'x-real-ip': '203.0.113.9' },
+  }
+  assert.equal(resolveClientIp(proxied, { trustProxy: true }), '203.0.113.9')
+})
+
+test('visitors record blocked and login failures separately', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({ dataDir: dir, users: [{ username: 'u', password: 'p', role: 'user' }] })
-    const user = store.findUser('u')
-    const ws = store.createWorkspace(user, { name: 'Project A', path: '/tmp/evil' })
-    assert.equal(ws.owner, 'u')
-    assert.equal(ws.external, false)
-    assert.ok(_internals.inside(ws.path, store.userWorkspaceRoot('u')))
-    assert.ok(existsSync(ws.path))
+    const visitors = createVisitorsStore(dir)
+    visitors.record('1.2.3.4', 'ip_blocked')
+    visitors.record('1.2.3.4', 'login_failed')
+    const stats = visitors.getStats()
+    assert.equal(stats.totalIllegalBlocked, 1)
+    assert.equal(stats.totalLoginFailures, 1)
+    assert.equal(visitors.listVisitors().length, 1)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('admin can add external workspace', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  const ext = mkdtempSync(join(tmpdir(), 'lha-ext-'))
+test('store persists config', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({ dataDir: dir, users: [{ username: 'a', password: 'p', role: 'admin' }] })
-    const user = store.findUser('a')
-    const ws = store.addExternalWorkspace(user, { path: ext })
-    assert.equal(ws.owner, 'a')
-    assert.equal(ws.external, true)
-    assert.equal(ws.path, ext)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-    rmSync(ext, { recursive: true, force: true })
-  }
-})
-
-test('sha256 password verification works', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const hash = _internals.sha256('secret')
-    const store = _internals.createStore({ dataDir: dir, users: [{ username: 'u', passwordSha256: hash, role: 'user' }] })
-    const user = store.findUser('u')
-    assert.equal(store.verifyPassword(user, 'secret'), true)
-    assert.equal(store.verifyPassword(user, 'bad'), false)
+    const store = createStore({ dataDir: dir })
+    store.setPasswordHash(hashPassword('test-password'))
+    store.updateConfig({ allow: ['127.0.0.1', '1.2.3.4'] })
+    const again = createStore({ dataDir: dir })
+    assert.ok(again.cfg.passwordHash)
+    assert.equal(verifyPassword('test-password', again.cfg.passwordHash), true)
+    assert.deepEqual(again.cfg.allow, ['127.0.0.1', '1.2.3.4'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-function mockRegistry(initial = []) {
-  const entities = new Map(initial.map((w) => [w.id, { ...w }]))
-  return {
-    list() {
-      return [...entities.values()]
-    },
-    async create(path, title) {
-      const real = resolve(path)
-      for (const e of entities.values()) {
-        if (resolve(e.path) === real) return e
-      }
-      const id = 'n_' + entities.size + '_' + Math.random().toString(16).slice(2, 8)
-      const row = { id, path: real, title: title || 'ws' }
-      entities.set(id, row)
-      return row
-    },
-    async resolveByPath(path) {
-      const real = resolve(path)
-      for (const e of entities.values()) {
-        if (resolve(e.path) === real) return e
-      }
-      return undefined
-    },
-    async delete(id) {
-      return entities.delete(id)
-    },
-    _entities: entities,
-  }
-}
+test('lockout after failed attempts', () => {
+  const lockout = { attempts: 0, lockedUntil: 0 }
+  const opts = { maxAttempts: 3, lockMinutes: 30 }
+  recordFailedAttempt(lockout, '1.1.1.1', opts)
+  recordFailedAttempt(lockout, '1.1.1.1', opts)
+  const third = recordFailedAttempt(lockout, '1.1.1.1', opts)
+  assert.equal(third.locked, true)
+  const status = checkLockout(lockout, opts)
+  assert.equal(status.locked, true)
+})
 
-test('patched list uses ALS user, not state.currentUser', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
+test('gate blocks non-whitelisted ip on api path', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [
-        { username: 'a', password: 'p', role: 'user' },
-        { username: 'b', password: 'p', role: 'user' },
-      ],
+    const store = createStore({ dataDir: dir, allow: ['127.0.0.1'] })
+    const gate = createGate(store)
+    let statusCode = 0
+    const req = {
+      url: '/api/foo',
+      socket: { remoteAddress: '203.0.113.50' },
+      headers: {},
+    }
+    const res = {
+      writeHead(code) { statusCode = code },
+      end() {},
+    }
+    const result = gate.checkIpGate(req, res)
+    assert.equal(result, true)
+    assert.equal(statusCode, 403)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('detect nginx misconfig when proxied without x-real-ip', () => {
+  const req = {
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: 'dsh.example.com' },
+  }
+  const info = detectNginxMisconfig(req)
+  assert.equal(info.misconfigured, true)
+  assert.equal(info.code, 'nginx_missing_x_real_ip')
+})
+
+test('direct localhost access is not flagged as nginx misconfig', () => {
+  const req = {
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: '127.0.0.1:3080' },
+  }
+  assert.equal(detectNginxMisconfig(req).misconfigured, false)
+  assert.equal(requestHost(req), '127.0.0.1')
+})
+
+test('nginx proxy with x-real-ip is ok', () => {
+  const req = {
+    socket: { remoteAddress: '127.0.0.1' },
+    headers: { host: 'dsh.example.com', 'x-real-ip': '203.0.113.50' },
+  }
+  assert.equal(detectNginxMisconfig(req).misconfigured, false)
+  assert.equal(resolveClientIp(req, { trustProxy: true }), '203.0.113.50')
+})
+
+test('gate blocks api when nginx misconfigured', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const store = createStore({ dataDir: dir })
+    const gate = createGate(store)
+    let body = ''
+    const req = {
+      url: '/api/foo',
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: { host: 'dsh.example.com' },
+    }
+    const res = {
+      statusCode: 0,
+      writeHead(code) { this.statusCode = code },
+      end(text) { body = text },
+    }
+    assert.equal(gate.checkNginxGate(req, res), true)
+    assert.equal(res.statusCode, 503)
+    assert.match(body, /nginx_missing_x_real_ip/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('passkey available on https or localhost only', () => {
+  assert.equal(getPasskeyContext({
+    headers: { host: 'dsh.example.com', 'x-forwarded-proto': 'https' },
+    socket: {},
+  }).available, true)
+  assert.equal(getPasskeyContext({
+    headers: { host: '127.0.0.1:3080' },
+    socket: {},
+  }).available, true)
+  assert.equal(getPasskeyContext({
+    headers: { host: '192.168.1.10:3080' },
+    socket: {},
+  }).available, false)
+  const status = passkeyStatus({ headers: { host: '192.168.1.10:3080' }, socket: {} })
+  assert.equal(status.available, false)
+  assert.ok(status.hint)
+})
+
+test('route policy excludes configured prefixes from auth skip', () => {
+  const excludes = ['/pluginrepo']
+  assert.equal(isAuthExcluded('/pluginrepo/api/packages', excludes), true)
+  assert.equal(isAuthExcluded('/api/foo', excludes), false)
+  assert.equal(shouldWrapPrefix('/pluginrepo', { mode: 'protect-all', excludePrefixes: excludes }), true)
+  assert.equal(shouldWrapPrefix('/api', { mode: 'protect-all', excludePrefixes: excludes }), true)
+})
+
+test('bearer api token authenticates gate', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const store = createStore({ dataDir: dir, allow: ['203.0.113.50'] })
+    const created = store.tokens.createApiToken('sync')
+    const gate = createGate(store)
+    let statusCode = 0
+    const req = {
+      url: '/api/foo',
+      socket: { remoteAddress: '203.0.113.50' },
+      headers: { authorization: `Bearer ${created.token}` },
+    }
+    const res = {
+      writeHead(code) { statusCode = code },
+      end() {},
+      setHeader() {},
+    }
+    assert.equal(gate.isAuthenticated(req), true)
+    const ipResult = gate.checkIpGate(req, res)
+    assert.equal(ipResult.ip, '203.0.113.50')
+    assert.equal(gate.wrapHttpHandler(() => { statusCode = 200 }) (req, res), undefined)
+    assert.equal(statusCode, 200)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('wrapWebServer wraps all prefixes in protect-all mode', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const store = createStore({ dataDir: dir })
+    const gate = createGate(store)
+    const handlers = {
+      api: () => {},
+      pluginrepo: () => {},
+    }
+    const webServer = {
+      prefixes: new Map([
+        ['/api', { handler: handlers.api }],
+        ['/pluginrepo', { handler: handlers.pluginrepo }],
+      ]),
+      upgrades: new Map(),
+      exacts: new Map(),
+    }
+    const unpatch = wrapWebServer(webServer, gate, store)
+    assert.equal(typeof webServer.prefixes.get('/api').handler, 'function')
+    assert.equal(webServer.prefixes.get('/api').__dshGateWrapped, true)
+    assert.equal(webServer.prefixes.get('/pluginrepo').__dshGateWrapped, true)
+    unpatch()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('outbound fetch injects peer bearer token', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const peers = createPeersStore(dir)
+    peers.addOutboundPeer({
+      name: 'VPS',
+      baseUrl: 'https://vps.example.com',
+      token: 'peer-secret-token',
     })
-    const userA = store.findUser('a')
-    const userB = store.findUser('b')
-    const wsA = store.createWorkspace(userA, { name: 'wa' })
-    const wsB = store.createWorkspace(userB, { name: 'wb' })
-    store.issueSession(userB)
-    assert.equal(store.activeUser()?.username, 'b')
-
-    const registry = mockRegistry([
-      { id: 'na', path: wsA.path, title: 'wa' },
-      { id: 'nb', path: wsB.path, title: 'wb' },
-    ])
-    const unpatch = _internals.patchWorkspaceRegistry({ logger: { info() {} } }, registry, store)
-    try {
-      const listed = _internals.runWithUser(userA, () => registry.list())
-      assert.equal(listed.length, 1)
-      assert.equal(resolve(listed[0].path), resolve(wsA.path))
-    } finally {
-      unpatch()
+    const calls = []
+    const original = async (url, init) => {
+      calls.push({ url, init })
+      return { ok: true }
     }
+    globalThis.fetch = original
+    const restore = installOutboundFetch(peers)
+    await globalThis.fetch('https://vps.example.com/pluginrepo/api/packages')
+    assert.equal(calls.length, 1)
+    assert.match(String(calls[0].init.headers.get('authorization')), /Bearer peer-secret-token/)
+    restore()
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('patched list shows account-root paths even without plugin row', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
+test('excluded prefix skips auth but keeps ip gate', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({
+    const store = createStore({
       dataDir: dir,
-      users: [{ username: 'a', password: 'p', role: 'user' }],
+      allow: ['127.0.0.1'],
+      routePolicy: { mode: 'protect-all', excludePrefixes: ['/pluginrepo'] },
     })
-    const userA = store.findUser('a')
-    const root = store.userWorkspaceRoot('a')
-    const under = resolve(root, 'native-only')
-    const registry = mockRegistry([
-      { id: 'n1', path: under, title: 'native-only' },
-      { id: 'nx', path: '/tmp/other-ws-y', title: 'x' },
-    ])
-    const unpatch = _internals.patchWorkspaceRegistry({ logger: { info() {} } }, registry, store)
-    try {
-      const listed = _internals.runWithUser(userA, () => registry.list())
-      assert.equal(listed.length, 1)
-      assert.equal(resolve(listed[0].path), under)
-    } finally {
-      unpatch()
+    const gate = createGate(store)
+    let statusCode = 0
+    const req = {
+      url: '/pluginrepo/api/packages',
+      socket: { remoteAddress: '203.0.113.50' },
+      headers: {},
     }
+    const res = {
+      writeHead(code) { statusCode = code },
+      end() {},
+    }
+    gate.wrapHttpHandler(() => { statusCode = 200 })(req, res)
+    assert.equal(statusCode, 403)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('patched list pass-through when ALS empty', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
+test('excluded prefix allows unauthenticated access when ip passes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({
+    const store = createStore({
       dataDir: dir,
-      users: [{ username: 'a', password: 'p', role: 'user' }],
+      allow: ['203.0.113.50'],
+      routePolicy: { mode: 'protect-all', excludePrefixes: ['/pluginrepo'] },
     })
-    const userA = store.findUser('a')
-    const wsA = store.createWorkspace(userA, { name: 'wa' })
-    const registry = mockRegistry([
-      { id: 'na', path: wsA.path, title: 'wa' },
-      { id: 'nx', path: '/tmp/other-ws-x', title: 'x' },
-    ])
-    const original = registry.list()
-    const unpatch = _internals.patchWorkspaceRegistry({ logger: { info() {} } }, registry, store)
-    try {
-      assert.equal(_internals.userFromAls(), null)
-      const listed = registry.list()
-      assert.equal(listed.length, original.length)
-      assert.deepEqual(
-        listed.map((w) => w.id).sort(),
-        original.map((w) => w.id).sort(),
-      )
-    } finally {
-      unpatch()
+    const gate = createGate(store)
+    let statusCode = 0
+    const req = {
+      url: '/pluginrepo/api/packages',
+      socket: { remoteAddress: '203.0.113.50' },
+      headers: {},
     }
+    const res = {
+      writeHead(code) { statusCode = code },
+      end() {},
+    }
+    gate.wrapHttpHandler(() => { statusCode = 200 })(req, res)
+    assert.equal(statusCode, 200)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('ensureNativeWorkspace sets nativeWorkspaceId via resolve then create', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
+test('peer pairing code can be claimed once', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'a', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('a')
-    const ws = store.createWorkspace(user, { name: 'adopt-me' })
-    assert.ok(!ws.nativeWorkspaceId)
-
-    const registry = mockRegistry()
-    const unpatch = _internals.patchWorkspaceRegistry({ logger: { info() {} } }, registry, store)
-    try {
-      await _internals.ensureNativeWorkspace(registry, store, user, ws)
-      assert.ok(ws.nativeWorkspaceId)
-      const again = store.listWorkspaces(user).find((w) => w.id === ws.id)
-      assert.equal(again.nativeWorkspaceId, ws.nativeWorkspaceId)
-      const resolved = await registry.resolveByPath(ws.path)
-      assert.equal(String(resolved.id), String(ws.nativeWorkspaceId))
-    } finally {
-      unpatch()
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('deleteWorkspace returns record and API deletes native id', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'a', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('a')
-    const ws = store.createWorkspace(user, { name: 'to-del' })
-    const registry = mockRegistry()
-    await _internals.ensureNativeWorkspace(registry, store, user, ws)
-    const nativeId = ws.nativeWorkspaceId
-    assert.ok(nativeId)
-    assert.ok(registry._entities.has(nativeId))
-
-    const removed = store.deleteWorkspace(user, ws.id)
-    assert.ok(removed)
-    assert.equal(removed.nativeWorkspaceId, nativeId)
-    assert.equal(store.listWorkspaces(user).length, 0)
-
-    // Simulate API delete sync path
-    if (removed.nativeWorkspaceId && typeof registry.delete === 'function') {
-      await registry.delete(removed.nativeWorkspaceId)
-    }
-    assert.equal(registry._entities.has(nativeId), false)
-    assert.ok(existsSync(ws.path), 'disk directory must remain')
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('patched create remaps path outside account root for role=user', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'u', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('u')
-    const root = store.userWorkspaceRoot('u')
-    const registry = mockRegistry()
-    const unpatch = _internals.patchWorkspaceRegistry({ logger: { info() {} } }, registry, store)
-    try {
-      const native = await _internals.runWithUser(user, () => registry.create('/tmp/not-under-account', 'evil'))
-      assert.ok(_internals.inside(native.path, root))
-      assert.equal(resolve(native.path), resolve(root, 'not-under-account'))
-    } finally {
-      unpatch()
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('directory picker list is clamped to account root for role=user', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'u', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('u')
-    const root = resolve(store.userWorkspaceRoot('u'))
-    const listed = []
-    const cap = {
-      kind: 'browse',
-      async list(path) {
-        listed.push(path)
-        return {
-          path: resolve(path),
-          home: '/home/ubuntu',
-          crumbs: [
-            { name: '/', path: '/' },
-            { name: 'home', path: '/home' },
-            { name: 'ubuntu', path: '/home/ubuntu' },
-            { name: 'workspaces', path: root },
-          ],
-          entries: [{ name: 'peer', path: '/home/ubuntu/peer', isDirectory: true }],
-          truncated: false,
-        }
-      },
-      async createDirectory(path, name) {
-        return join(path, name)
-      },
-    }
-    const picker = { capability() { return cap } }
-    const ctx = {
-      get(name) { return name === 'directoryPicker' ? picker : undefined },
-      logger: { info() {} },
-    }
-    const unpatch = _internals.patchDirectoryPicker(ctx, store)
-    try {
-      const out = await _internals.runWithUser(user, () => cap.list('/home/ubuntu'))
-      assert.equal(out.home, root)
-      assert.equal(out.path, root)
-      assert.ok(listed.includes(root))
-      assert.ok(out.crumbs.every((c) => _internals.inside(c.path, root)))
-    } finally {
-      unpatch()
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('sessionVisibleTo isolates sessions by owner cwd and sessionOwners', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  const adminDir = mkdtempSync(join(tmpdir(), 'lha-admin-ws-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [
-        { username: 'admin', password: 'p', role: 'admin' },
-        { username: 'u', password: 'p', role: 'user' },
-      ],
-    })
-    const admin = store.findUser('admin')
-    const user = store.findUser('u')
-    const adminWs = store.addExternalWorkspace(admin, { path: adminDir })
-    store.rememberSessionOwner(admin, 's-admin', adminWs.path)
-    const userWs = store.createWorkspace(user, { name: 'mine' })
-    store.rememberSessionOwner(user, 's-user', userWs.path)
-
-    assert.equal(store.sessionVisibleTo(user, { id: 's-admin', header: { cwd: adminWs.path } }), false)
-    assert.equal(store.sessionVisibleTo(user, { id: 's-user', header: { cwd: userWs.path } }), true)
-    assert.equal(store.sessionVisibleTo(user, { sessionId: 's-user', cwd: '/tmp/other' }), true)
-    assert.equal(store.sessionVisibleTo(admin, { id: 's-user', header: { cwd: userWs.path } }), false)
-    assert.equal(store.sessionVisibleTo(admin, { id: 's-admin', cwd: adminWs.path }), true)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-    rmSync(adminDir, { recursive: true, force: true })
-  }
-})
-
-test('reAdoptAll does not recreate workspaces whose directory was deleted', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'u', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('u')
-    const ws = store.createWorkspace(user, { name: 'gone' })
-    assert.ok(existsSync(ws.path))
-    // 用户删掉了文件夹（文件系统层面），但 state.workspaces 记录还在。
-    rmSync(ws.path, { recursive: true, force: true })
-    assert.equal(existsSync(ws.path), false)
-
-    let createCalls = 0
-    const registry = {
-      async resolveByPath() { return undefined },
-      async create() { createCalls++ ; return { id: 'n_recreated' } },
-    }
-
-    _internals.reAdoptAll(store, registry)
-
-    // 目录已被删除：不得重新 create（否则重启后文件夹“又加回来”）。
-    assert.equal(createCalls, 0)
-    assert.equal(existsSync(ws.path), false)
-    // 失效记录应被清理，列表不再残留。
-    assert.equal(store.listWorkspaces(user).length, 0)
-    assert.equal(store.state.workspaces.some((w) => w.id === ws.id), false)
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
-test('ensureNativeWorkspace skips workspaces whose directory was deleted', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'lha-'))
-  try {
-    const store = _internals.createStore({
-      dataDir: dir,
-      users: [{ username: 'u', password: 'p', role: 'user' }],
-    })
-    const user = store.findUser('u')
-    const ws = store.createWorkspace(user, { name: 'gone2' })
-    rmSync(ws.path, { recursive: true, force: true })
-
-    let createCalls = 0
-    const registry = {
-      async resolveByPath() { return undefined },
-      async create() { createCalls++ ; return { id: 'n_recreated' } },
-    }
-
-    _internals.ensureNativeWorkspace(registry, store, user, ws)
-    assert.equal(createCalls, 0)
-    assert.equal(existsSync(ws.path), false)
+    const peers = createPeersStore(dir)
+    const { code } = peers.createPairingCode()
+    const first = peers.claimPairingCode({ code, peerName: 'Home', peerBaseUrl: 'https://home.test' })
+    const second = peers.claimPairingCode({ code, peerName: 'Home', peerBaseUrl: 'https://home.test' })
+    assert.equal(first.ok, true)
+    assert.ok(first.token)
+    assert.equal(second.ok, false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

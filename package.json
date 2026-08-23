@@ -1,7 +1,7 @@
 {
   "name": "dsh-local-hanaccount",
-  "version": "0.1.1",
-  "description": "Local account and account-scoped workspace gate for DeepSeek Harness web profile",
+  "version": "2.3.0",
+  "description": "Access lock for DeepSeek Harness web profile (password, passkey, IP lists, Nginx)",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -26,8 +26,9 @@
     "deepseek-harness",
     "cordis",
     "plugin",
-    "hanaccount",
-    "workspace"
+    "gate",
+    "access-control",
+    "security"
   ],
   "author": "han0423",
   "license": "MIT",
@@ -50,5 +51,8 @@
         "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "^13.3.2"
   }
 }
