@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createStore } from '../src/lib/store.js'
-import { evaluateIpAccess, ipInList, ipMatchesEntry, resolveClientIp, detectNginxMisconfig, requestHost } from '../src/lib/ip.js'
+import { evaluateIpAccess, ipInList, ipMatchesEntry, resolveClientIp, detectNginxMisconfig, requestHost, applyIpListChange, isValidIpOrCidr, normalizeIpEntry, isLoopbackIp } from '../src/lib/ip.js'
+import { writeJson } from '../src/lib/util.js'
 import { getPasskeyContext, passkeyStatus } from '../src/lib/passkey-context.js'
 import { hashPassword, verifyPassword, checkLockout, recordFailedAttempt } from '../src/lib/password.js'
 import { createVisitorsStore } from '../src/lib/visitors.js'
@@ -34,6 +35,61 @@ test('cidr matching', () => {
   assert.equal(ipMatchesEntry('192.168.1.10', '192.168.1.0/24'), true)
   assert.equal(ipMatchesEntry('192.168.2.10', '192.168.1.0/24'), false)
   assert.ok(ipInList('192.168.1.5', ['192.168.0.0/16']))
+})
+
+test('ip list validation and mutual exclusion', () => {
+  assert.equal(isValidIpOrCidr('203.0.113.10'), true)
+  assert.equal(isValidIpOrCidr('192.168.1.0/24'), true)
+  assert.equal(isValidIpOrCidr('not-an-ip'), false)
+  assert.equal(isValidIpOrCidr('192.168.1.0/33'), false)
+  assert.equal(normalizeIpEntry('::ffff:203.0.113.10'), '203.0.113.10')
+
+  const cfg = { allow: ['127.0.0.1'], deny: [] }
+  const toDeny = applyIpListChange(cfg, { listKey: 'deny', entry: '127.0.0.1' })
+  assert.equal(toDeny.error, 'loopback')
+
+  const toAllow = applyIpListChange({ allow: [], deny: ['10.0.0.1'] }, { listKey: 'allow', entry: '10.0.0.1' })
+  assert.deepEqual(toAllow.allow, ['10.0.0.1'])
+  assert.deepEqual(toAllow.deny, [])
+})
+
+test('cannot deny-list loopback addresses', () => {
+  const cfg = { allow: ['127.0.0.1'], deny: [] }
+  const r = applyIpListChange(cfg, { listKey: 'deny', entry: '127.0.0.1' })
+  assert.equal(r.error, 'loopback')
+  assert.deepEqual(r.deny, [])
+})
+
+test('store strips loopback from deny on load', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    writeJson(join(dir, 'config.json'), {
+      passwordHash: '',
+      allow: ['127.0.0.1', '::1'],
+      deny: ['127.0.0.1'],
+      ipLimitEnabled: true,
+      lockout: { maxAttempts: 5, lockMinutes: 30 },
+      routePolicy: { mode: 'protect-all', excludePrefixes: [] },
+    })
+    const store = createStore({ dataDir: dir })
+    assert.deepEqual(store.cfg.deny, [])
+    assert.ok(store.cfg.allow.includes('127.0.0.1'))
+    assert.ok(store.cfg.allow.includes('::1'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('store enforces deny over allow on save', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const store = createStore({ dataDir: dir })
+    store.updateConfig({ allow: ['1.2.3.4', '10.0.0.1'], deny: ['10.0.0.1'] })
+    assert.deepEqual(store.cfg.allow, ['::1', '127.0.0.1', '1.2.3.4'])
+    assert.deepEqual(store.cfg.deny, ['10.0.0.1'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('resolve client ip ignores forwarded headers on direct connection', () => {
@@ -73,7 +129,7 @@ test('store persists config', () => {
     const again = createStore({ dataDir: dir })
     assert.ok(again.cfg.passwordHash)
     assert.equal(verifyPassword('test-password', again.cfg.passwordHash), true)
-    assert.deepEqual(again.cfg.allow, ['127.0.0.1', '1.2.3.4'])
+    assert.deepEqual(again.cfg.allow, ['::1', '127.0.0.1', '1.2.3.4'])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -233,12 +289,51 @@ test('wrapWebServer wraps all prefixes in protect-all mode', () => {
         ['/pluginrepo', { handler: handlers.pluginrepo }],
       ]),
       upgrades: new Map(),
-      exacts: new Map(),
+      exact: new Map(),
     }
     const unpatch = wrapWebServer(webServer, gate, store)
     assert.equal(typeof webServer.prefixes.get('/api').handler, 'function')
     assert.equal(webServer.prefixes.get('/api').__dshGateWrapped, true)
     assert.equal(webServer.prefixes.get('/pluginrepo').__dshGateWrapped, true)
+    unpatch()
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('wrapWebServer wraps exact routes (dsh-host-webserver uses .exact)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
+  try {
+    const store = createStore({ dataDir: dir, allow: ['127.0.0.1'] })
+    const gate = createGate(store)
+    let originalCalled = false
+    const webServer = {
+      prefixes: new Map(),
+      upgrades: new Map(),
+      exact: new Map([
+        ['/dsh-version-updater/status', {
+          handler: () => { originalCalled = true },
+        }],
+      ]),
+    }
+    const unpatch = wrapWebServer(webServer, gate, store)
+    const route = webServer.exact.get('/dsh-version-updater/status')
+    assert.equal(route.__dshGateWrapped, true)
+
+    let statusCode = 0
+    const req = {
+      url: '/dsh-version-updater/status',
+      socket: { remoteAddress: '127.0.0.1' },
+      headers: {},
+    }
+    const res = {
+      writeHead(code) { statusCode = code },
+      end() {},
+      setHeader() {},
+    }
+    route.handler(req, res)
+    assert.equal(statusCode, 401)
+    assert.equal(originalCalled, false)
     unpatch()
   } finally {
     rmSync(dir, { recursive: true, force: true })

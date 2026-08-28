@@ -16,7 +16,7 @@ import {
   saveAuthorizedKeys,
   verifyKeySignature,
 } from './lib/key-auth.js'
-import { detectNginxMisconfig, detectProxy, ipInList, nginxSnippet } from './lib/ip.js'
+import { detectNginxMisconfig, detectProxy, nginxSnippet, applyIpListChange } from './lib/ip.js'
 import { passkeyStatus } from './lib/passkey-context.js'
 import {
   authenticationOptions,
@@ -287,12 +287,10 @@ export function createApiHandler({ store, gate }) {
       if (req.method === 'POST' && visitorAction) {
         const targetIp = decodeURIComponent(visitorAction[1])
         const action = visitorAction[2]
-        if (action === 'allow') {
-          if (!ipInList(targetIp, store.cfg.allow)) store.cfg.allow.push(targetIp)
-          store.updateConfig({ allow: store.cfg.allow })
-        } else if (action === 'deny') {
-          if (!ipInList(targetIp, store.cfg.deny)) store.cfg.deny.push(targetIp)
-          store.updateConfig({ deny: store.cfg.deny })
+        if (action === 'allow' || action === 'deny') {
+          const next = applyIpListChange(store.cfg, { listKey: action, entry: targetIp })
+          if (next.error) throw httpError(400, next.error === 'loopback' ? 'cannot block loopback' : next.error === 'invalid' ? 'invalid ip' : 'empty ip')
+          store.updateConfig({ allow: next.allow, deny: next.deny })
         }
         store.visitors.dismiss(targetIp)
         sendJson(res, 200, { ok: true, config: store.publicConfig() })

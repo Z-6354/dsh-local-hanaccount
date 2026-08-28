@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-hanaccount",
-  "version": "2.3.0",
+  "version": "2.3.11",
   "description": "Access lock for DeepSeek Harness web profile (password, passkey, IP lists, Nginx)",
   "type": "module",
   "main": "./src/index.js",
@@ -19,7 +19,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:attack": "node --test test/attack-sim.test.js",
+    "simulate-attacks": "node scripts/simulate-attacks.mjs"
   },
   "keywords": [
     "dsh",

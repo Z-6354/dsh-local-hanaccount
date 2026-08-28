@@ -228,7 +228,8 @@ export function wrapWebServer(webServer, gate, store) {
       wrappedPrefixes.add(`exact:${path}`)
       return true
     }
-    const route = webServer?.exacts?.get?.(path)
+    // WebServer stores exact routes on `.exact` (singular), not `.exacts`.
+    const route = webServer?.exact?.get?.(path)
     if (!route) return false
     const entry = wrapRouteHandler(route, gate)
     if (entry === true) {
@@ -260,7 +261,7 @@ export function wrapWebServer(webServer, gate, store) {
     for (const prefixPath of webServer?.prefixes?.keys?.() ?? []) {
       if (!wrapHttpPrefix(prefixPath)) ok = false
     }
-    for (const exactPath of webServer?.exacts?.keys?.() ?? []) {
+    for (const exactPath of webServer?.exact?.keys?.() ?? []) {
       if (!wrapExact(exactPath)) ok = false
     }
     if (!wrapUpgrade('/api/events.host')) ok = false
