@@ -5,6 +5,7 @@ import {
   shouldWrapPrefix,
 } from './lib/route-policy.js'
 import { parseCookies, sendJson, sendText, COOKIE } from './lib/util.js'
+import { randomBytes } from 'node:crypto'
 
 const PUBLIC_API_SUFFIXES = [
   'auth/me',
@@ -31,7 +32,20 @@ function bearerToken(req) {
   return auth.slice(7).trim()
 }
 
-export function createGate(store) {
+export function createGate(store, bridge) {
+  const active = new Map()
+  function recheckSockets() {
+    for (const [socket, req] of active) {
+      const session = parseCookies(req)[COOKIE]
+      if (ipContext(req).verdict.action === 'block' || (session && !store.sessionFromToken(session, {touch:false})) || !isAuthenticated(req, false)) {
+        active.delete(socket)
+        socket.destroy()
+      }
+    }
+  }
+  const unsubscribe = store.onSecurityChange?.(recheckSockets)
+  const expiryTimer = setInterval(recheckSockets, 60000)
+  expiryTimer.unref()
   function clientIp(req) {
     return resolveClientIp(req, { trustProxy: store.cfg.trustProxy })
   }
@@ -42,10 +56,10 @@ export function createGate(store) {
     return { ip, verdict }
   }
 
-  function isSessionAuthenticated(req) {
+  function isSessionAuthenticated(req, touch = true) {
     if (!store.cfg.passwordHash) return false
     const token = parseCookies(req)[COOKIE]
-    return !!store.sessionFromToken(token)
+    return !!store.sessionFromToken(token, {touch})
   }
 
   function isBearerAuthenticated(req) {
@@ -54,14 +68,10 @@ export function createGate(store) {
     return !!store.tokens.verifyAny(raw, store.peers.inboundVerifierEntries())
   }
 
-  function isAuthenticated(req) {
-    return isSessionAuthenticated(req) || isBearerAuthenticated(req)
-  }
-
-  function tryNginxBasic(req) {
-    if (!store.cfg.nginxBasicAutoLogin) return false
-    const auth = req.headers?.authorization || ''
-    return auth.startsWith('Basic ')
+  function isAuthenticated(req, touch = true) {
+    const gateAuthenticated = isSessionAuthenticated(req, touch) || isBearerAuthenticated(req)
+    if (!gateAuthenticated) return false
+    try { return !bridge || bridge.authenticated(req) } catch { return false }
   }
 
   function recordIfSuspicious(ip, reason, req, { whitelisted = false } = {}) {
@@ -74,14 +84,14 @@ export function createGate(store) {
 
   function blockIp(res, ip, reason, req, whitelisted) {
     recordIfSuspicious(ip, reason, req, { whitelisted })
-    sendText(res, 403, 'Forbidden')
+    sendJson(res, 403, {error:'access_denied', code:'access_denied'})
     return true
   }
 
   function checkNginxGate(req, res) {
     const info = detectNginxMisconfig(req)
     if (!info.misconfigured) return false
-    sendJson(res, 503, { error: info.code, message: info.message, nginxMisconfig: info })
+    sendJson(res, 503, { error: 'proxy_misconfigured', code:'proxy_misconfigured', nginxMisconfig: info })
     return true
   }
 
@@ -95,24 +105,14 @@ export function createGate(store) {
 
   function checkAuthGate(req, res, { ip, whitelisted }) {
     if (isAuthenticated(req)) return true
-    if (tryNginxBasic(req)) {
-      const token = store.issueSession()
-      res.setHeader('set-cookie', requireSetCookie(token))
-      return true
-    }
     recordIfSuspicious(ip, 'unauthenticated', req, { whitelisted })
     sendJson(res, 401, { error: 'login required' })
     return false
   }
 
-  function requireSetCookie(token) {
-    const maxAge = Math.max(1, Number(store.cfg.sessionMaxAgeDays) || 7) * 24 * 60 * 60
-    return `${COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`
-  }
-
   function shouldSkipAuth(pathname) {
     if (isAuthExcluded(pathname, BUILTIN_AUTH_EXCLUDE_PREFIXES)) return true
-    return isAuthExcluded(pathname, store.cfg.routePolicy?.excludePrefixes)
+    return false
   }
 
   function wrapHttpHandler(originalHandler) {
@@ -127,7 +127,23 @@ export function createGate(store) {
       if (ipResult === true) return
       const { ip, whitelisted } = ipResult
 
-      if (!shouldSkipAuth(pathname) && !checkAuthGate(req, res, { ip, whitelisted })) return
+      if (bridge) {
+        try { bridge.fence(req) } catch (err) { sendJson(res, err.status || 503, {code:err.code, error:err.code}); return }
+        if (['/', '/index.html'].includes(pathname) && ['GET','HEAD'].includes(req.method)) {
+          if (url.searchParams.has('token')) {
+            res.writeHead(303, {location:'/', 'cache-control':'no-store', 'referrer-policy':'no-referrer'}); res.end(); return
+          }
+          if (!isSessionAuthenticated(req) || !bridge.authenticated(req)) {
+            const nonce = randomBytes(18).toString('base64')
+            res.writeHead(200, {'content-type':'text/html; charset=utf-8','cache-control':'no-store','referrer-policy':'no-referrer','content-security-policy':`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`})
+            res.end(req.method === 'HEAD' ? undefined : `<!doctype html><html><meta name="viewport" content="width=device-width"><title>Harness sign in</title><style nonce="${nonce}">body{font:18px system-ui;max-width:28rem;margin:15vh auto;padding:24px}input,button{font:inherit;padding:12px;margin:8px 0;width:100%;box-sizing:border-box}</style><h1>Harness sign in</h1><form><label>Password<input type="password" autocomplete="current-password" required></label><button>Connect</button><button type="button" id="cancel" hidden>Cancel</button><p role="status"></p></form><script nonce="${nonce}">const f=document.querySelector('form'),p=f.querySelector('input'),b=f.querySelector('button'),e=f.querySelector('p'),c=document.querySelector('#cancel');let a;c.onclick=()=>a?.abort();f.onsubmit=async x=>{x.preventDefault();a=new AbortController;b.disabled=true;c.hidden=false;e.textContent='Connecting…';try{const r=await fetch('/dsh-local-hanaccount/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:p.value}),signal:a.signal,redirect:'error'});const j=await r.json();if(!r.ok)throw Error(j.code||'Sign in failed');p.value='';location.replace('/')}catch(x){e.textContent=x.name==='AbortError'?'Cancelled':x.message}finally{b.disabled=false;c.hidden=true;a=null}}</script></html>`)
+            return
+          }
+        }
+      }
+
+      const publicStaticRead = ['GET', 'HEAD'].includes(req.method) && shouldSkipAuth(pathname)
+      if (!publicStaticRead && !checkAuthGate(req, res, { ip, whitelisted })) return
       return originalHandler(req, res)
     }
   }
@@ -146,11 +162,14 @@ export function createGate(store) {
         socket.destroy()
         return
       }
-      if (!shouldSkipAuth(pathname) && !isAuthenticated(req) && !tryNginxBasic(req)) {
+      try { bridge?.fence(req) } catch { socket.destroy(); return }
+      if (!isAuthenticated(req)) {
         recordIfSuspicious(ip, 'unauthenticated', req, { whitelisted: verdict.whitelisted })
         socket.destroy()
         return
       }
+      active.set(socket, req)
+      socket.once?.('close', () => active.delete(socket))
       return originalHandler(req, socket, head)
     }
   }
@@ -164,124 +183,66 @@ export function createGate(store) {
     recordIfSuspicious,
     wrapHttpHandler,
     wrapUpgradeHandler,
+    dispose() { clearInterval(expiryTimer); unsubscribe?.(); for (const socket of active.keys()) socket.destroy(); active.clear() },
   }
 }
 
-function wrapRouteHandler(route, gate) {
-  if (!route || typeof route.handler !== 'function' || route.__dshGateWrapped) {
-    return !!route?.__dshGateWrapped
-  }
-  const original = route.handler
-  route.handler = gate.wrapHttpHandler(original)
-  route.__dshGateWrapped = true
-  return { original, route }
-}
-
-function wrapUpgradeRoute(route, gate) {
-  if (!route || typeof route.handler !== 'function' || route.__dshGateWrapped) {
-    return !!route?.__dshGateWrapped
-  }
-  const original = route.handler
-  route.handler = gate.wrapUpgradeHandler(original)
-  route.__dshGateWrapped = true
-  return { original, route }
-}
-
+// Wrap Map.set synchronously: official WebServer.register uses these maps.
+// Direct mutation of a route.handler or replacement of a map is unsupported.
+const installations = new WeakMap()
 export function wrapWebServer(webServer, gate, store) {
-  const restored = []
-  let stopped = false
-  let timer = null
-  const wrappedPrefixes = new Set()
-  const wrappedUpgrades = new Set()
-
-  function shouldWrap(prefixPath) {
-    return shouldWrapPrefix(prefixPath, store.cfg.routePolicy)
+  if (installations.has(webServer)) throw new Error('hanaccount gate already installed')
+  for (const slot of ['prefixes', 'exact', 'upgrades']) {
+    if (!(webServer[slot] instanceof Map)) throw new Error(`unsupported WebServer route table: ${slot}`)
   }
-
-  function undoWrap(entry) {
-    if (!entry) return
-    entry.route.handler = entry.original
-    delete entry.route.__dshGateWrapped
+  const restores = []
+  const descriptor = Object.getOwnPropertyDescriptor(webServer, 'fallback')
+  if (!descriptor || !descriptor.configurable || !('value' in descriptor)
+    || (descriptor.value !== undefined && typeof descriptor.value !== 'function')) throw new Error('unsupported WebServer fallback seat')
+  let fallbackOriginal = descriptor.value
+  let fallbackWrapped = fallbackOriginal && gate.wrapHttpHandler(fallbackOriginal)
+  Object.defineProperty(webServer, 'fallback', {configurable:true, enumerable:descriptor.enumerable,
+    get() { return fallbackWrapped },
+    set(handler) {
+      if (handler !== undefined && typeof handler !== 'function') throw new Error('unsupported WebServer fallback handler')
+      fallbackOriginal = handler; fallbackWrapped = handler && gate.wrapHttpHandler(handler)
+    },
+  })
+  restores.push(() => Object.defineProperty(webServer, 'fallback', {...descriptor, value:fallbackOriginal}))
+  const wrappers = new WeakSet()
+  const slots = ['prefixes', 'exact', 'upgrades']
+  for (const slot of slots) {
+    const map = webServer[slot]
+    if (!map?.set || !map?.entries) continue
+    const originalSet = map.set
+    const ownSet = Object.getOwnPropertyDescriptor(map, 'set')
+    function wrap(path, route) {
+      if (!route || typeof route.handler !== 'function') return
+      if (slot !== 'upgrades' && !shouldWrapPrefix(path, store.cfg.routePolicy)) return
+      if (wrappers.has(route.handler)) return
+      const original = route.handler
+      const wrapped = slot === 'upgrades' ? gate.wrapUpgradeHandler(original) : gate.wrapHttpHandler(original)
+      wrappers.add(wrapped)
+      route.handler = wrapped
+      route.__dshGateWrapped = true
+      restores.push(() => { if (route.handler === wrapped) { route.handler = original; delete route.__dshGateWrapped } })
+    }
+    for (const [path, route] of map.entries()) wrap(path, route)
+    const patchedSet = function(path, route) { wrap(path, route); return originalSet.call(this, path, route) }
+    map.set = patchedSet
+    restores.push(() => {
+      if (map.set !== patchedSet) return
+      if (ownSet) Object.defineProperty(map, 'set', ownSet)
+      else delete map.set
+    })
   }
-
-  function wrapHttpPrefix(prefixPath) {
-    if (wrappedPrefixes.has(prefixPath)) return true
-    if (!shouldWrap(prefixPath)) {
-      wrappedPrefixes.add(prefixPath)
-      return true
-    }
-    const route = webServer?.prefixes?.get?.(prefixPath)
-    const entry = wrapRouteHandler(route, gate)
-    if (entry === true) {
-      wrappedPrefixes.add(prefixPath)
-      return true
-    }
-    if (!entry) return false
-    wrappedPrefixes.add(prefixPath)
-    restored.push(() => undoWrap(entry))
-    return true
+  let disposed = false
+  const dispose = () => {
+    if (disposed) return
+    disposed = true
+    for (const undo of restores.reverse()) undo()
+    installations.delete(webServer)
   }
-
-  function wrapExact(path) {
-    if (wrappedPrefixes.has(`exact:${path}`)) return true
-    if (!shouldWrap(path)) {
-      wrappedPrefixes.add(`exact:${path}`)
-      return true
-    }
-    // WebServer stores exact routes on `.exact` (singular), not `.exacts`.
-    const route = webServer?.exact?.get?.(path)
-    if (!route) return false
-    const entry = wrapRouteHandler(route, gate)
-    if (entry === true) {
-      wrappedPrefixes.add(`exact:${path}`)
-      return true
-    }
-    if (!entry) return false
-    wrappedPrefixes.add(`exact:${path}`)
-    restored.push(() => undoWrap(entry))
-    return true
-  }
-
-  function wrapUpgrade(path) {
-    if (wrappedUpgrades.has(path)) return true
-    const route = webServer?.upgrades?.get?.(path)
-    const entry = wrapUpgradeRoute(route, gate)
-    if (entry === true) {
-      wrappedUpgrades.add(path)
-      return true
-    }
-    if (!entry) return false
-    wrappedUpgrades.add(path)
-    restored.push(() => undoWrap(entry))
-    return true
-  }
-
-  function attachAll() {
-    let ok = true
-    for (const prefixPath of webServer?.prefixes?.keys?.() ?? []) {
-      if (!wrapHttpPrefix(prefixPath)) ok = false
-    }
-    for (const exactPath of webServer?.exact?.keys?.() ?? []) {
-      if (!wrapExact(exactPath)) ok = false
-    }
-    if (!wrapUpgrade('/api/events.host')) ok = false
-    if (!wrapUpgrade('/api/events.mux')) ok = false
-    return ok
-  }
-
-  attachAll()
-  timer = setInterval(() => {
-    if (stopped) return
-    attachAll()
-  }, 500)
-
-  return () => {
-    stopped = true
-    if (timer) clearInterval(timer)
-    for (const undo of restored.splice(0)) {
-      try { undo() } catch {}
-    }
-    wrappedPrefixes.clear()
-    wrappedUpgrades.clear()
-  }
+  installations.set(webServer, dispose)
+  return dispose
 }

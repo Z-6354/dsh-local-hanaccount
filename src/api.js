@@ -1,3 +1,4 @@
+import { AUTH_PROTOCOL } from './lib/native-bridge.js'
 import {
   API_PREFIX,
   COOKIE,
@@ -16,7 +17,7 @@ import {
   saveAuthorizedKeys,
   verifyKeySignature,
 } from './lib/key-auth.js'
-import { detectNginxMisconfig, detectProxy, nginxSnippet, applyIpListChange } from './lib/ip.js'
+import { isLoopbackIp, requestHost, detectNginxMisconfig, detectProxy, nginxSnippet, applyIpListChange } from './lib/ip.js'
 import { passkeyStatus } from './lib/passkey-context.js'
 import {
   authenticationOptions,
@@ -25,7 +26,7 @@ import {
   verifyRegistration,
 } from './lib/passkey.js'
 
-export function createApiHandler({ store, gate }) {
+export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAuthentication }) {
   const challenges = createChallengeStore()
   const pairFailures = new Map()
   const PAIR_FAIL_LIMIT = 10
@@ -50,11 +51,31 @@ export function createApiHandler({ store, gate }) {
       row.resetAt = now + PAIR_FAIL_WINDOW_MS
     }
     row.count += 1
+    for (const [key, entry] of pairFailures) if (entry.resetAt <= now) pairFailures.delete(key)
+    if (!pairFailures.has(ip) && pairFailures.size >= 1024) pairFailures.delete(pairFailures.keys().next().value)
     pairFailures.set(ip, row)
   }
 
   function authToken(req) {
     return parseCookies(req)[COOKIE]
+  }
+  function secureCookie(req) {
+    return !!req.socket?.encrypted || (store.cfg.trustProxy && detectProxy(req).viaTrustedProxy && req.headers?.['x-forwarded-proto'] === 'https')
+  }
+
+  function grant(req, res, extra = {}, expectedVersion = store.cfg.passwordHash, identityValid = () => true) {
+    if (!bridge) throw Object.assign(new Error('native_bridge_unavailable'), {status:503, code:'native_bridge_unavailable'})
+    if (expectedVersion !== store.cfg.passwordHash) throw Object.assign(new Error('native_bridge_unavailable'), {status:503, code:'native_bridge_unavailable'})
+    if (!identityValid()) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
+    const version = store.cfg.passwordHash
+    const native = bridge.mint(req, secureCookie(req))
+    if (!identityValid()) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
+    if (version !== store.cfg.passwordHash) throw Object.assign(new Error('native_bridge_unavailable'), {status:503})
+    const previous = new Set(Object.keys(store.state.sessions))
+    let token
+    try { token = store.issueSession() }
+    catch { for (const key of Object.keys(store.state.sessions)) if (!previous.has(key)) delete store.state.sessions[key]; throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'}) }
+    sendJson(res, 200, {ok:true, protocol:AUTH_PROTOCOL, ...extra}, {'set-cookie':[setCookieHeader(token, store.cfg.sessionMaxAgeDays, secureCookie(req)), native]})
   }
 
   function requireAuth(req, res) {
@@ -76,14 +97,16 @@ export function createApiHandler({ store, gate }) {
     try {
       const url = new URL(req.url ?? '/', 'http://x')
       const sub = url.pathname.slice(API_PREFIX.length).replace(/^\/+/, '')
+      bridge?.fence(req)
       const nginxInfo = detectNginxMisconfig(req)
       const isProbe = sub === 'status' || sub === 'auth/me' || sub === 'nginx/snippet'
 
       if (nginxInfo.misconfigured && !isProbe) {
-        sendJson(res, 503, { error: nginxInfo.code, message: nginxInfo.message, nginxMisconfig: nginxInfo })
+        sendJson(res, 503, { error: 'proxy_misconfigured', code:'proxy_misconfigured', nginxMisconfig: nginxInfo })
         return
       }
 
+      if (req.method === 'POST' && ['auth/login','auth/setup'].includes(sub) && !/^application\/json(?:;|$)/i.test(String(req.headers?.['content-type'] || ''))) throw httpError(415, 'application/json required')
       const meta = ipMeta(req)
 
       // IP gate for plugin API (public auth routes still blocked if IP denied)
@@ -103,6 +126,8 @@ export function createApiHandler({ store, gate }) {
           nginxMisconfig: nginxInfo.misconfigured ? nginxInfo : null,
           passkey,
           routePolicy: store.publicConfig().routePolicy,
+          auth: { protocol: AUTH_PROTOCOL, passwordOnly: !!bridge, nativeSessionBridge: !!bridge },
+          deviceIntegration: { ready: false, nativeAuthBridge: false, scopedCredentials: false, durableNotifications: false },
         })
         return
       }
@@ -112,6 +137,8 @@ export function createApiHandler({ store, gate }) {
         const session = store.cfg.passwordHash ? store.sessionFromToken(token) : null
         sendJson(res, 200, {
           authenticated: !!session,
+          nativeAuthenticated: bridge ? bridge.authenticated(req) : false,
+          protocol: AUTH_PROTOCOL,
           passwordConfigured: !!store.cfg.passwordHash,
           ip: meta.ip,
           whitelisted: meta.whitelisted,
@@ -148,28 +175,36 @@ export function createApiHandler({ store, gate }) {
       }
 
       if (req.method === 'POST' && sub === 'auth/setup') {
+        const localHost = ['localhost', '127.0.0.1', '::1'].includes(requestHost(req))
+        let sameOrigin = true
+        if (req.headers?.origin) {
+          try { sameOrigin = new URL(req.headers.origin).host === req.headers.host } catch { sameOrigin = false }
+        }
+        if (!isLoopbackIp(req.socket?.remoteAddress) || !localHost || !sameOrigin || detectProxy(req).hasForwardedHeaders) {
+          sendJson(res, 403, { error: 'setup requires direct loopback' }); return
+        }
         if (store.cfg.passwordHash) {
           sendJson(res, 400, { error: 'password already configured' })
           return
         }
         const body = await readBody(req)
         const password = String(body.password ?? '')
+        if (store.cfg.passwordHash) throw httpError(409, 'password already configured')
         if (password.length < 8) throw httpError(400, 'password must be at least 8 characters')
         store.setPasswordHash(hashPassword(password))
-        const token = store.issueSession()
-        sendJson(res, 200, { ok: true }, { 'set-cookie': setCookieHeader(token, store.cfg.sessionMaxAgeDays) })
+        grant(req, res)
         return
       }
 
       if (req.method === 'POST' && sub === 'auth/login') {
         if (!store.cfg.passwordHash) {
-          sendJson(res, 400, { error: 'password not configured; use setup first' })
+          sendJson(res, 400, { error: 'password_not_configured', code: 'password_not_configured' })
           return
         }
         const lockout = store.getLockout(ip)
         const lock = checkLockout(lockout, store.cfg.lockout)
         if (lock.locked) {
-          sendJson(res, 429, { error: 'too many attempts', retryAfterSec: lock.retryAfterSec })
+          sendJson(res, 429, { error: 'rate_limited', code: 'rate_limited', retryAfterSec: lock.retryAfterSec })
           return
         }
         const body = await readBody(req)
@@ -178,19 +213,18 @@ export function createApiHandler({ store, gate }) {
           const fail = recordFailedAttempt(lockout, ip, store.cfg.lockout)
           if (!whitelisted) gate.recordIfSuspicious(ip, fail.reason, req, { whitelisted })
           store.saveState()
-          sendJson(res, 401, { error: 'invalid password' })
+          sendJson(res, 401, { error: 'invalid_password', code: 'invalid_password' })
           return
         }
         resetLockout(lockout)
         store.saveState()
-        const token = store.issueSession()
-        sendJson(res, 200, { ok: true }, { 'set-cookie': setCookieHeader(token, store.cfg.sessionMaxAgeDays) })
+        grant(req, res)
         return
       }
 
       if (req.method === 'POST' && sub === 'auth/logout') {
         store.logout(authToken(req))
-        sendJson(res, 200, { ok: true }, { 'set-cookie': clearCookieHeader() })
+        sendJson(res, 200, { ok: true }, { 'set-cookie': [clearCookieHeader(), bridge.clear(req, secureCookie(req))] })
         return
       }
 
@@ -211,26 +245,29 @@ export function createApiHandler({ store, gate }) {
       }
 
       if (req.method === 'POST' && sub === 'auth/passkey/login/verify') {
+        const version = store.cfg.passwordHash
         const body = await readBody(req)
+        let authenticatedCredential
         try {
-          await verifyAuthentication(req, store.passkeys, body)
+          authenticatedCredential = await verifyPasskey(req, store.passkeys, body)
         } catch (e) {
           if (!whitelisted) gate.recordIfSuspicious(ip, 'login_failed', req, { whitelisted })
           throw e
         }
         resetLockout(store.getLockout(ip))
         store.saveState()
-        const token = store.issueSession()
-        sendJson(res, 200, { ok: true }, { 'set-cookie': setCookieHeader(token, store.cfg.sessionMaxAgeDays) })
+        grant(req, res, {}, version, () => store.passkeys.findByCredentialId(authenticatedCredential.credentialId) === authenticatedCredential)
         return
       }
 
       if (req.method === 'POST' && sub === 'auth/key/verify') {
+        const version = store.cfg.passwordHash
         if (!store.cfg.keyAuthEnabled) {
           sendJson(res, 400, { error: 'key auth disabled' })
           return
         }
         const body = await readBody(req)
+        if (!store.cfg.keyAuthEnabled) throw Object.assign(new Error('key_auth_disabled'), {status:401, code:'key_auth_disabled'})
         const consumed = challenges.consume(body.challengeId, body.signature)
         if (!consumed.ok) {
           sendJson(res, 401, { error: consumed.error || 'invalid challenge' })
@@ -243,8 +280,7 @@ export function createApiHandler({ store, gate }) {
           sendJson(res, 401, { error: 'signature verification failed' })
           return
         }
-        const token = store.issueSession()
-        sendJson(res, 200, { ok: true, keyId: matched.id }, { 'set-cookie': setCookieHeader(token, store.cfg.sessionMaxAgeDays) })
+        grant(req, res, {keyId: matched.id}, version, () => store.cfg.keyAuthEnabled && loadAuthorizedKeys(store.keysFile).some(key => key.key.equals(matched.key)))
         return
       }
 
@@ -427,7 +463,7 @@ export function createApiHandler({ store, gate }) {
 
       sendJson(res, 404, { error: 'not found' })
     } catch (err) {
-      sendJson(res, err?.status || 500, { error: String(err?.message || err) })
+      sendJson(res, err?.status || 500, { error: err?.code || (err?.status ? String(err.message) : 'internal_error'), code: err?.code || (err?.status === 403 ? 'access_denied' : 'internal_error') }, [408, 413].includes(err?.status) ? {connection:'close'} : {})
     }
   }
 }

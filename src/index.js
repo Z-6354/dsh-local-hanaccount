@@ -1,3 +1,4 @@
+import { createNativeBridge } from './lib/native-bridge.js'
 import { API_PREFIX } from './lib/util.js'
 import { createStore } from './lib/store.js'
 import { createGate, wrapWebServer } from './gate.js'
@@ -5,7 +6,7 @@ import { createApiHandler } from './api.js'
 import { installOutboundFetch } from './lib/outbound-fetch.js'
 
 export const name = 'dsh-local-hanaccount'
-export const inject = ['webServer']
+export const inject = ['webServer', 'connection']
 
 const DEFAULTS = {
   enabled: true,
@@ -23,15 +24,23 @@ export async function apply(ctx, config = {}) {
   }
 
   const store = createStore(cfg)
-  const gate = createGate(store)
-  const unpatchWeb = wrapWebServer(webServer, gate, store)
-  const unpatchFetch = installOutboundFetch(store.peers)
-
-  const disposer = webServer.register({
-    kind: 'prefix',
-    path: API_PREFIX,
-    handler: createApiHandler({ store, gate }),
-  })
+  const bridge = createNativeBridge(ctx.get('connection'))
+  const gate = createGate(store, bridge)
+  let unpatchWeb, unpatchFetch, disposer
+  try {
+    unpatchWeb = wrapWebServer(webServer, gate, store)
+    unpatchFetch = installOutboundFetch(store.peers)
+    disposer = webServer.register({
+      kind: 'prefix',
+      path: API_PREFIX,
+      handler: createApiHandler({ store, gate, bridge }),
+    })
+  } catch (err) {
+    unpatchWeb?.()
+    unpatchFetch?.()
+    gate.dispose()
+    throw err
+  }
 
   ctx.provide?.('dshLocalHanaccount', {
     dataDir: store.dataDir,
@@ -42,6 +51,7 @@ export async function apply(ctx, config = {}) {
   ctx.on('dispose', () => {
     try { disposer() } catch {}
     try { unpatchWeb() } catch {}
+    try { gate.dispose(); bridge.dispose() } catch {}
     try { unpatchFetch() } catch {}
   })
 }

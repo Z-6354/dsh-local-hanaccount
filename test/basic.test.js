@@ -284,7 +284,7 @@ test('wrapWebServer wraps all prefixes in protect-all mode', () => {
       pluginrepo: () => {},
     }
     const webServer = {
-      prefixes: new Map([
+      fallback: undefined, prefixes: new Map([
         ['/api', { handler: handlers.api }],
         ['/pluginrepo', { handler: handlers.pluginrepo }],
       ]),
@@ -308,7 +308,7 @@ test('wrapWebServer wraps exact routes (dsh-host-webserver uses .exact)', () => 
     const gate = createGate(store)
     let originalCalled = false
     const webServer = {
-      prefixes: new Map(),
+      fallback: undefined, prefixes: new Map(),
       upgrades: new Map(),
       exact: new Map([
         ['/dsh-version-updater/status', {
@@ -391,7 +391,7 @@ test('excluded prefix skips auth but keeps ip gate', () => {
   }
 })
 
-test('excluded prefix allows unauthenticated access when ip passes', () => {
+test('excluded prefix cannot bypass authentication', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
     const store = createStore({
@@ -411,7 +411,7 @@ test('excluded prefix allows unauthenticated access when ip passes', () => {
       end() {},
     }
     gate.wrapHttpHandler(() => { statusCode = 200 })(req, res)
-    assert.equal(statusCode, 200)
+    assert.equal(statusCode, 401)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

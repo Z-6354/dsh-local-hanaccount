@@ -1,7 +1,7 @@
 /**
  * Attack simulation — gate-level (offline) + optional live probe against running DSH.
  *
- * Live: set DSH_ATTACK_TARGET=http://127.0.0.1:3080 (default when reachable).
+ * Live: set DSH_ATTACK_TARGET=http://127.0.0.1:3080 and DSH_ATTACK_OPT_IN=1; never probes a default target.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
@@ -63,7 +63,7 @@ test('attack: non-whitelisted IP gets 403 (ip_blocked)', () => {
     const { res, blocked } = runIpGate(store, req)
     assert.equal(blocked, true)
     assert.equal(res.statusCode, 403)
-    assert.match(res.body, /Forbidden/)
+    assert.match(res.body, /access_denied/)
     const visitors = store.visitors.listVisitors()
     assert.ok(visitors.some((v) => v.ip === '203.0.113.50' && v.lastReason === 'ip_blocked'))
   } finally {
@@ -173,7 +173,7 @@ test('attack: wrapWebServer protects dynamically registered routes', () => {
     store.setPasswordHash(hashPassword('test-password-123'))
     const gate = createGate(store)
     const webServer = {
-      prefixes: new Map([
+      fallback: undefined, prefixes: new Map([
         ['/api', { handler() {} }],
       ]),
       exact: new Map(),
@@ -192,28 +192,16 @@ test('attack: wrapWebServer protects dynamically registered routes', () => {
   }
 })
 
-const LIVE_DEFAULT = 'http://127.0.0.1:3080'
 let liveTarget = process.env.DSH_ATTACK_TARGET || ''
 let liveOk = false
 
 test('live probe: detect running DSH', async (t) => {
-  if (liveTarget) {
-    liveOk = true
-    return
-  }
-  try {
-    const r = await fetch(`${LIVE_DEFAULT}/dsh-local-hanaccount/api/status`, { signal: AbortSignal.timeout(3000) })
-    if (r.ok) {
-      liveTarget = LIVE_DEFAULT
-      liveOk = true
-    }
-  } catch {
-    t.skip('DSH not reachable; set DSH_ATTACK_TARGET to run live attack probes')
-  }
+  if (process.env.DSH_ATTACK_OPT_IN !== '1' || !liveTarget) { t.skip('explicit DSH_ATTACK_OPT_IN=1 and DSH_ATTACK_TARGET required'); return }
+  liveOk = true
 })
 
 test('live: attacker IP blocked on protected API', async (t) => {
-  if (!liveOk) t.skip()
+  if (!liveOk) { t.skip('live attacks disabled'); return }
   const attacker = '203.0.113.99'
   const r = await fetch(`${liveTarget}/api/events.host`, {
     headers: { 'X-Real-IP': attacker, 'User-Agent': 'lha-attack-sim/1.0' },
@@ -222,7 +210,7 @@ test('live: attacker IP blocked on protected API', async (t) => {
 })
 
 test('live: attacker IP blocked even on plugin status', async (t) => {
-  if (!liveOk) t.skip()
+  if (!liveOk) { t.skip('live attacks disabled'); return }
   const attacker = '198.51.100.42'
   const r = await fetch(`${liveTarget}/dsh-local-hanaccount/api/status`, {
     headers: { 'X-Real-IP': attacker },
@@ -231,7 +219,7 @@ test('live: attacker IP blocked even on plugin status', async (t) => {
 })
 
 test('live: localhost unauthenticated gets 401 not 403', async (t) => {
-  if (!liveOk) t.skip()
+  if (!liveOk) { t.skip('live attacks disabled'); return }
   const r = await fetch(`${liveTarget}/api/events.host`)
   assert.equal(r.status, 401)
   const body = await r.json()
@@ -252,7 +240,7 @@ test('attack: IP limit blocks login endpoint for external IP', () => {
 })
 
 test('live: wrong password from localhost returns 401', async (t) => {
-  if (!liveOk) t.skip()
+  if (!liveOk) { t.skip('live attacks disabled'); return }
   const r = await fetch(`${liveTarget}/dsh-local-hanaccount/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -264,7 +252,7 @@ test('live: wrong password from localhost returns 401', async (t) => {
 })
 
 test('live: attacker IP blocked before login (403 not 401)', async (t) => {
-  if (!liveOk) t.skip()
+  if (!liveOk) { t.skip('live attacks disabled'); return }
   const r = await fetch(`${liveTarget}/dsh-local-hanaccount/api/auth/login`, {
     method: 'POST',
     headers: {
