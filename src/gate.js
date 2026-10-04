@@ -6,6 +6,7 @@ import {
 } from './lib/route-policy.js'
 import { parseCookies, sendJson, sendText, COOKIE } from './lib/util.js'
 import { randomBytes } from 'node:crypto'
+import { renderLoginPage } from './lib/login-page.js'
 
 const PUBLIC_API_SUFFIXES = [
   'auth/me',
@@ -136,7 +137,7 @@ export function createGate(store, bridge) {
           if (!isSessionAuthenticated(req) || !bridge.authenticated(req)) {
             const nonce = randomBytes(18).toString('base64')
             res.writeHead(200, {'content-type':'text/html; charset=utf-8','cache-control':'no-store','referrer-policy':'no-referrer','content-security-policy':`default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`})
-            res.end(req.method === 'HEAD' ? undefined : `<!doctype html><html><meta name="viewport" content="width=device-width"><title>Harness sign in</title><style nonce="${nonce}">body{font:18px system-ui;max-width:28rem;margin:15vh auto;padding:24px}input,button{font:inherit;padding:12px;margin:8px 0;width:100%;box-sizing:border-box}</style><h1>Harness sign in</h1><form><label>Password<input type="password" autocomplete="current-password" required></label><button>Connect</button><button type="button" id="cancel" hidden>Cancel</button><p role="status"></p></form><script nonce="${nonce}">const f=document.querySelector('form'),p=f.querySelector('input'),b=f.querySelector('button'),e=f.querySelector('p'),c=document.querySelector('#cancel');let a;c.onclick=()=>a?.abort();f.onsubmit=async x=>{x.preventDefault();a=new AbortController;b.disabled=true;c.hidden=false;e.textContent='Connecting…';try{const r=await fetch('/dsh-local-hanaccount/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({password:p.value}),signal:a.signal,redirect:'error'});const j=await r.json();if(!r.ok)throw Error(j.code||'Sign in failed');p.value='';location.replace('/')}catch(x){e.textContent=x.name==='AbortError'?'Cancelled':x.message}finally{b.disabled=false;c.hidden=true;a=null}}</script></html>`)
+            res.end(req.method === 'HEAD' ? undefined : renderLoginPage(nonce))
             return
           }
         }

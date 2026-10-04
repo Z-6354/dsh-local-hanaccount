@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-hanaccount",
-  "version": "2.4.0",
+  "version": "2.4.1",
   "description": "Access lock for DeepSeek Harness web profile (password, passkey, IP lists, Nginx)",
   "type": "module",
   "main": "./src/index.js",

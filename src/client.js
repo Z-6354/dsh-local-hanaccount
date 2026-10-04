@@ -290,6 +290,9 @@ window.__ModuleLoader__.load({
     function LoginGate() {
       const snap = useSharedState()
       React.useEffect(ensureStyle, [])
+      React.useEffect(() => {
+        if (!snap.loading && !snap.me?.nginxMisconfig?.misconfigured && (!snap.me?.passwordConfigured || !snap.me?.authenticated || !snap.me?.nativeAuthenticated)) window.location.replace('/')
+      }, [snap.loading, snap.me])
       if (snap.loading) {
         return jsx(AuthOverlay, { children: jsxs('div', { 'data-lha-content': '', children: [
           jsxs('div', { 'data-lha-loading': '', children: [
@@ -301,115 +304,7 @@ window.__ModuleLoader__.load({
       if (snap.me?.nginxMisconfig?.misconfigured) {
         return jsx(AuthOverlay, { children: jsx(NginxMisconfigCard, { info: snap.me.nginxMisconfig }) })
       }
-      if (!snap.me?.passwordConfigured) {
-        return jsx(AuthOverlay, { setup: true, children: jsx(SetupCard, {}) })
-      }
-      if (!snap.me?.authenticated) {
-        return jsx(AuthOverlay, { children: jsx(LoginCard, { me: snap.me }) })
-      }
       return null
-    }
-
-    function SetupCard() {
-      const [password, setPassword] = React.useState('')
-      const [confirm, setConfirm] = React.useState('')
-      const [busy, setBusy] = React.useState(false)
-      const [err, setErr] = React.useState('')
-      const pwdOk = password.length >= 8
-      const confirmOk = confirm.length > 0 && password === confirm
-
-      async function submit(ev) {
-        ev.preventDefault()
-        setBusy(true); setErr('')
-        try {
-          if (password.length < 8) throw new Error('密码至少 8 位')
-          if (password !== confirm) throw new Error('两次密码不一致')
-          await api('/auth/setup', { method: 'POST', body: JSON.stringify({ password }) })
-          await refreshMe()
-        } catch (e) { setErr(String(e.message || e)) }
-        finally { setBusy(false) }
-      }
-
-      return jsxs('div', { 'data-lha-content': '', children: [
-        jsx('p', { 'data-lha-wordmark': '', children: 'DEEPSEEK HARNESS' }),
-        jsx('h2', { 'data-lha-title': '', children: '设置访问密码' }),
-        jsx('p', { 'data-lha-desc': '', children: '首次使用需为本机 DSH 设置访问密码，用于保护 Web 界面与插件 API。' }),
-        jsxs('form', { onSubmit: submit, children: [
-          jsxs('div', { 'data-lha-body': '', children: [
-            err ? jsx('div', { 'data-lha-error': '', children: err }) : null,
-            jsxs('div', { 'data-lha-field': '', children: [
-              jsx('span', { children: '密码' }),
-              jsx('input', { type: 'password', value: password, autoFocus: true, onChange: (e) => setPassword(e.target.value), autoComplete: 'new-password', placeholder: '至少 8 位' }),
-            ] }),
-            jsxs('div', { 'data-lha-field': '', children: [
-              jsx('span', { children: '确认密码' }),
-              jsx('input', { type: 'password', value: confirm, onChange: (e) => setConfirm(e.target.value), autoComplete: 'new-password', placeholder: '再次输入' }),
-            ] }),
-            jsx('p', { 'data-lha-hint': '', children: pwdOk ? (confirmOk ? '密码符合要求，可以提交' : '请确认两次密码一致') : '密码至少 8 位' }),
-          ] }),
-          jsx('div', { 'data-lha-footer': '', children: jsx('button', { type: 'submit', 'data-lha-btn': '', className: 'primary', disabled: busy || !pwdOk || !confirmOk, children: busy ? '设置中…' : '设置密码并继续' }) }),
-        ] }),
-      ] })
-    }
-
-    function LoginCard({ me }) {
-      const [mode, setMode] = React.useState('password')
-      const [password, setPassword] = React.useState('')
-      const [busy, setBusy] = React.useState(false)
-      const [err, setErr] = React.useState('')
-      const passkey = me?.passkey || {}
-      const canPasskey = clientPasskeyReady() && passkey.available
-      const hasPasskeys = (passkey.count || 0) > 0
-
-      React.useEffect(() => {
-        if (canPasskey && hasPasskeys) setMode('passkey')
-      }, [canPasskey, hasPasskeys])
-
-      async function submitPassword(ev) {
-        ev.preventDefault()
-        setBusy(true); setErr('')
-        try {
-          await api('/auth/login', { method: 'POST', body: JSON.stringify({ password }) })
-          await refreshMe()
-        } catch (e) { setErr(String(e.message || e)) }
-        finally { setBusy(false) }
-      }
-
-      async function submitPasskey(ev) {
-        ev?.preventDefault?.()
-        setBusy(true); setErr('')
-        try {
-          await passkeyLogin()
-        } catch (e) { setErr(String(e.message || e)) }
-        finally { setBusy(false) }
-      }
-
-      return jsxs('div', { 'data-lha-content': '', children: [
-        jsx('p', { 'data-lha-wordmark': '', children: 'DEEPSEEK HARNESS' }),
-        jsx('h2', { 'data-lha-title': '', children: '登录' }),
-        jsx('p', { 'data-lha-desc': '', children: '输入访问密码以继续使用 DSH。' }),
-        jsxs('div', { 'data-lha-body': '', children: [
-          me?.ip ? jsx('p', { 'data-lha-hint': '', children: `当前 IP：${me.ip}${me.whitelisted ? '（白名单）' : ''}` }) : null,
-          !me?.whitelisted && me?.ip ? jsx('div', { 'data-lha-warn': '', children: '您的 IP 不在白名单，登录后请在设置中添加。' }) : null,
-          !canPasskey && passkey.hint ? jsx('p', { 'data-lha-hint': '', children: passkey.hint }) : null,
-          err ? jsx('div', { 'data-lha-error': '', children: err }) : null,
-          canPasskey && hasPasskeys ? jsxs('div', { 'data-lha-tabs': '', children: [
-            jsx('button', { type: 'button', className: mode === 'passkey' ? 'active' : '', onClick: () => setMode('passkey'), children: 'Passkey' }),
-            jsx('button', { type: 'button', className: mode === 'password' ? 'active' : '', onClick: () => setMode('password'), children: '密码' }),
-          ] }) : null,
-          mode === 'passkey' && canPasskey && hasPasskeys ? jsxs(React.Fragment, { children: [
-            jsx('p', { 'data-lha-desc': '', style: { marginTop: 0 }, children: '使用本机指纹、面容或安全密钥登录。' }),
-            jsx('button', { type: 'button', 'data-lha-btn': '', className: 'passkey', disabled: busy, onClick: submitPasskey, children: busy ? '验证中…' : '使用 Passkey 登录' }),
-          ] }) : null,
-          mode === 'password' || !hasPasskeys ? jsxs('form', { onSubmit: submitPassword, children: [
-            jsxs('div', { 'data-lha-field': '', children: [
-              jsx('span', { children: '密码' }),
-              jsx('input', { type: 'password', value: password, autoFocus: mode === 'password' || !hasPasskeys, onChange: (e) => setPassword(e.target.value), autoComplete: 'current-password' }),
-            ] }),
-            jsx('div', { 'data-lha-footer': '', style: { padding: 0, marginTop: 16 }, children: jsx('button', { type: 'submit', 'data-lha-btn': '', className: 'primary', disabled: busy || !password, children: busy ? '登录中…' : '继续' }) }),
-          ] }) : null,
-        ] }),
-      ] })
     }
 
     function GateSettingsSection() {
@@ -1142,7 +1037,7 @@ window.__ModuleLoader__.load({
       if (!snap.me?.authenticated) return null
       return jsx('button', { 'data-lha-chip': '', type: 'button', onClick: async () => {
         await api('/auth/logout', { method: 'POST', body: '{}' })
-        await refreshMe()
+        window.location.replace('/')
       }, children: '退出访问控制' })
     }
 

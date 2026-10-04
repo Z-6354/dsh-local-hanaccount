@@ -2,7 +2,9 @@
 
 Single-operator **access gate** for a local DSH Web profile: password, Passkey, IP whitelist/blacklist, block statistics, and optional Nginx integration. Public device access and durable server notifications are not ready.
 
-## Features (v2.4.0)
+## Features (v2.4.1)
+
+- **Unified login page** — first visits and access-control logout use the previous Chinese access-control dialog, including initial password setup and Passkey login.
 
 - **Ordinary URL + password** — open the original HTTPS website without a token suffix. The `password-native-v1` bridge establishes both gate and official Host sessions.
 - **Full route protection** — HTTP business routes, fallback pages and WebSocket upgrades require both identities; only GET/HEAD static resources are anonymously readable after entry/IP checks.
@@ -42,10 +44,10 @@ Restart DSH Web profile after install.
 
 ### GitHub download
 
-Download `dsh-local-hanaccount-2.4.0.tgz` from [GitHub Releases](https://github.com/Z-6354/dsh-local-hanaccount/releases/tag/v2.4.0). Extract the archive and install its `package` directory:
+Download `dsh-local-hanaccount-2.4.1.tgz` from [GitHub Releases](https://github.com/Z-6354/dsh-local-hanaccount/releases/tag/v2.4.1). Extract the archive and install its `package` directory:
 
 ```bash
-tar -xzf dsh-local-hanaccount-2.4.0.tgz
+tar -xzf dsh-local-hanaccount-2.4.1.tgz
 cd package
 npm install --omit=dev
 dsh plugin --profile web add "$PWD"

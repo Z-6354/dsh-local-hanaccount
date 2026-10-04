@@ -135,7 +135,7 @@ try {
    await Promise.all(staticClosed)
    assert.equal((await rpc(authHeaders)).status,401)
    const rootAfter = await request('/',{headers:{cookie:nativeCookie}})
-   assert.equal(rootAfter.status,200); assert.match(await rootAfter.text(),/Harness sign in/)
+   assert.equal(rootAfter.status,200); assert.match(await rootAfter.text(),/DEEPSEEK HARNESS/)
  }
  console.log(JSON.stringify({node:process.version,pluginStatus:true,loopbackSetup:true,passwordNativeBridge:true,dualCookieMe:true,singleCookieRejected:true,logoutSocketClosed:!serve,logoutRootProtected:!serve,unauthenticatedRejected:true,bearerOnlyNativeRejected:true,cookieRpc:true,remoteMuxReady:true,sessionEventObserved:true,canonicalSnapshot:true,activeBearerWsRevoked:true,staticHttpMutationDualAuth:true,staticUpgradeDualAuth:true,staticUpgradeLogoutClosed:!serve,dynamicUpgradeProtected:true,replacementProtected:true,denyIndependent:true,scopedDeviceCredentials:false,durableNotificationReplay:false}))
 } finally {
