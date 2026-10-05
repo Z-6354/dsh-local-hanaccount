@@ -311,6 +311,19 @@ test('returning during interrupted automatic login cannot revive its late redire
   assert.equal(Object.hasOwn(p.element('body').attributes,'data-checking'),false)
 })
 
+test('unauthenticated login uncovers before the credential bridge replies', async () => {
+  const delays = []
+  const bridge = { postMessage() {} }
+  const p = await page({ passwordConfigured: true, authenticated: false }, () => assert.fail(), {
+    window: { HanApp: bridge },
+    setTimeout: (_, delay) => { delays.push(delay); return delays.length },
+    clearTimeout() {},
+  })
+  assert.equal(p.readiness.length, 1)
+  assert.equal(p.readiness[0].type, 'pageReady')
+  assert.equal(p.element('body').hasAttribute('data-checking'), true)
+})
+
 test('revealed login sends only generic readiness without installing a reply handler', async () => {
   const original = () => {}
   const bridge = {onmessage:original,postMessage(){assert.fail('no credential operation for setup')}}
