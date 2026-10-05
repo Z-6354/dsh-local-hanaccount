@@ -109,4 +109,6 @@ test('LoginGate in the client plugin uses classified auth instead of treating er
   assert.match(client, /overlay: 'unavailable'/)
   assert.doesNotMatch(client, /me: \{ authenticated: false, error/)
   assert.match(client, /if \(decision\.redirect && session\.noteRedirect\(\)\) window\.location\.replace\('\/'\)/)
+  assert.match(client, /overlay === 'loading'[\s\S]{0,300}'data-lha-checking'/)
+  assert.doesNotMatch(client, /overlay === 'loading'[\s\S]{0,300}'data-lha-loading'/)
 })

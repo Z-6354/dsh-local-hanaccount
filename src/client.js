@@ -278,7 +278,7 @@ window.__ModuleLoader__.load({
 [data-lha-error]{padding:10px 12px;border-radius:12px;font-size:13px;line-height:20px;color:var(--dsw-alias-state-error-primary);background:color-mix(in srgb,var(--dsw-alias-state-error-primary) 10%,transparent);border:1px solid color-mix(in srgb,var(--dsw-alias-state-error-primary) 24%,transparent)}
 [data-lha-warn]{padding:10px 12px;border-radius:12px;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-interactive-bg-hover);border:1px solid var(--dsw-alias-border-l2)}
 [data-lha-hint]{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
-[data-lha-loading]{display:flex;align-items:center;gap:10px;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary)}
+[data-lha-loading],[data-lha-checking]{display:flex;align-items:center;gap:10px;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary)}
 [data-lha-spinner]{position:relative;width:20px;height:20px;border-radius:50%;border:2px solid var(--dsw-alias-border-l2);animation:lha-spin .8s linear infinite}
 [data-lha-spinner]::after{content:'';position:absolute;inset:-2px;border-radius:inherit;background:conic-gradient(var(--dsw-alias-brand-primary,var(--dsw-alias-label-primary)) 72deg,transparent 0);-webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 0);mask:radial-gradient(farthest-side,transparent calc(100% - 2px),#000 0)}
 @keyframes lha-spin{to{transform:rotate(360deg)}}
@@ -400,8 +400,9 @@ window.__ModuleLoader__.load({
         if (decision.redirect && session.noteRedirect()) window.location.replace('/')
       }, [decision.redirect])
       if (decision.overlay === 'loading') {
+        // data-lha-checking is visual-only; do not use data-lha-loading or hanui withholds pageReady.
         return jsx(AuthOverlay, { children: jsxs('div', { 'data-lha-content': '', children: [
-          jsxs('div', { 'data-lha-loading': '', children: [
+          jsxs('div', { 'data-lha-checking': '', children: [
             jsx('span', { 'data-lha-spinner': '' }),
             '正在检查访问控制…',
           ] }),
