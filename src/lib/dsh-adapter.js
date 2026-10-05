@@ -33,7 +33,8 @@ export function createNativeBridge(connection) {
         end() { ended = true },
       })
       const cookie = headers?.['set-cookie']
-      if (allowed !== false || !ended || status !== 303 || headers?.location !== '/'
+      const location = headers?.location
+      if (allowed !== false || !ended || status !== 303 || (location !== '/' && location !== './')
         || typeof cookie !== 'string' || !/^dsh-auth-[^=;\s]+=/.test(cookie)
         || cookie.includes('\r') || cookie.includes('\n')) throw failure()
       const check = Object.create(req)

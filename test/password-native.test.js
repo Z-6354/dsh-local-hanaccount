@@ -30,6 +30,12 @@ async function login({store,bridge,gate}, password='fixture-password', host='loc
 test('public native mint fences original Host and verifies minted cookie without changing request',()=>{
  const bridge=createNativeBridge(owner());const req={method:'POST',url:'/auth/login',headers:{host:'localhost'}};assert.match(bridge.mint(req,true),/; Secure$/);assert.equal(req.url,'/auth/login');assert.throws(()=>bridge.mint({...req,headers:{host:'evil'}}),{code:'access_denied'});bridge.dispose();assert.throws(()=>bridge.mint(req),{code:'native_bridge_unavailable'})
 })
+test('native mint accepts the official relative 303 to ./ used by dsh 0.2.1',()=>{
+ const connection=owner({authorizeIndex(req,res){assert.equal(req.url,'/?token=internal-only');res.writeHead(303,{location:'./','set-cookie':'dsh-auth-fixture=native; Path=/; HttpOnly; SameSite=Strict'});res.end();return false}})
+ const bridge=createNativeBridge(connection)
+ assert.match(bridge.mint({method:'POST',url:'/auth/login',headers:{host:'localhost'}}),/^dsh-auth-fixture=/)
+ bridge.dispose()
+})
 test('bridge rejects unavailable methods, unexpected response and failed official verification',()=>{
  assert.throws(()=>createNativeBridge({}),{code:'native_bridge_unavailable'});
  for(const connection of [owner({authorizeIndex(){return true}}),owner({requestRejection(){return 401}})]) assert.throws(()=>createNativeBridge(connection).mint({headers:{host:'localhost'}}),{code:'native_bridge_unavailable'})
