@@ -4,6 +4,11 @@
       name: dsh-local-hanaccount
       config:
         enabled: true
+        # Explicit audited build selection; operator attestation, not binary proof.
+        officialBuild: "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d"
+        canonicalOrigin: ""
+        loginStylesheetUrl: ""
+        outboundFetchEnabled: false
         dataDir: ""
         allow: ["127.0.0.1", "::1"]
         deny: []
@@ -12,4 +17,4 @@
         keyAuthEnabled: true
         routePolicy:
           mode: protect-all
-          excludePrefixes: ["/plugins"]
+          excludePrefixes: []

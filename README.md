@@ -2,20 +2,35 @@
 
 Single-operator **access gate** for a local DSH Web profile: password, Passkey, IP whitelist/blacklist, block statistics, and optional Nginx integration. Public device access and durable server notifications are not ready.
 
+**Public deployment remains blocked.** Official Loader tolerates optional plugin
+failures and keeps sibling listeners/routes running. A failed import, unknown
+build, missing dispatcher seat or a path outside the audited dispatcher can
+therefore expose official-cookie-only access. Throwing from this plugin is not
+a service shutdown guarantee. An external ingress must stay closed before
+verified security readiness, close on security loss and own existing connection
+teardown, or a required boot composition must prove equivalent behavior.
+
+This checkout requires explicit `officialBuild` selection:
+`0a15e36e7f82b6ed45af6fa9759f29b40dcd965d`. That value is operator attestation;
+it does not measure the running binary. The single adapter is
+`dsh-0a15e36-web-auth-v1`; unknown builds refuse activation. Its diagnostic
+`ready` means the audited route guard is active. `deploymentReady` remains false.
+Do not use either HTTP page rendering or the optional UI as deployment approval.
+
 ## Features (v2.4.1)
 
 - **Unified login page** — first visits and access-control logout use the previous Chinese access-control dialog, including initial password setup and Passkey login.
 
 - **Ordinary URL + password** — open the original HTTPS website without a token suffix. The `password-native-v1` bridge establishes both gate and official Host sessions.
-- **Full route protection** — HTTP business routes, fallback pages and WebSocket upgrades require both identities; only GET/HEAD static resources are anonymously readable after entry/IP checks.
-- **Revocation** — logout closes active sockets; key/passkey removal during an in-flight login cannot grant a new session.
+- **Audited route protection** — wrapped HTTP business routes, fallback pages and WebSocket upgrades require both identities. `/assets` and `/plugins` are protected on GET/HEAD too. Prefix names cannot establish static ownership.
+- **Revocation** — logout closes active upgrades and tracked business HTTP responses; account-control JSON acknowledgements remain writable. Already submitted server work is not cancelled. Key/passkey removal during an in-flight login cannot grant a new session.
 - **Mobile integration** — compatible with the new password-only App. Old Relay pairing is not an App login route.
 
 ## Existing gate features
 
 - **Protect-all routes** — wraps every plugin `webServer` prefix by default
 - **Fail-closed business routes** — `excludePrefixes` cannot exempt authenticated business routes
-- **Peer pairing** — cross-device Token; outbound `fetch` auto-injects Bearer
+- **Peer pairing** — cross-device Token; optional outbound `fetch` injection requires `outboundFetchEnabled: true` and is independently disposable
 - **API tokens** — manual Bearer keys for scripts
 
 ## Features (v2.1)
@@ -41,6 +56,45 @@ dsh plugin --profile web add /path/to/dsh-local-hanaccount
 ```
 
 Restart DSH Web profile after install.
+
+### Optional login stylesheet
+
+The built-in login page keeps the v2.4.1 dialog CSS in a server-owned static file,
+without importing the client module or loading React. The hanui mobile stylesheet
+is optional and must be deployed as a pure static resource at exactly
+`/hanui-assets/login.css`. The official `/plugins` module route is not assumed
+to serve arbitrary files. Configure an explicit canonical HTTPS origin and URL:
+
+```yaml
+officialBuild: "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d"
+canonicalOrigin: "https://your-host.example"
+loginStylesheetUrl: "https://your-host.example/hanui-assets/login.css"
+outboundFetchEnabled: false
+```
+
+Deploy hanui's packaged `src/login.css` to a separately owned static route or
+proxy mapping, with `Content-Type: text/css`. Only exact GET/HEAD reads at that
+configured origin/path may bypass the plugin session gate; upgrades, mutation
+verbs and queries remain protected. Host/IP/Origin fences still apply inside
+DSH. The stylesheet URL must have no credentials, query or fragment and must
+match the canonical HTTPS origin. Invalid configuration or failed loading leaves
+the local dialog usable; CSS never supplies authentication/readiness. CSP allows
+the validated stylesheet URL only, alongside the inline nonce. A trusted HTTPS
+termination proxy must remove forged forwarded headers and set the correct
+external Host (including port) and proto.
+
+### Local source compatibility checks
+
+Run `npm test` for isolated plugin tests. With the audited official source checkout
+and its existing dependencies, run
+`npm run test:official -- /absolute/path/to/deepseek-harness`. This starts only
+temporary loopback WebServer/Loader fixtures and in-memory fixture credentials;
+no model service or existing DSH home is loaded. It proves the supported source
+composition and separately demonstrates optional-loader exposure failures. It
+does not validate packaged binaries, public ingress, TLS or future versions.
+The former full CLI probe and `--serve-for-qa` mode are retired because the local
+built packages differed from source. See
+[the implementation evidence](docs/IMPLEMENTATION-2026-10-05.md).
 
 ### GitHub download
 
@@ -85,7 +139,16 @@ Passkey availability is detected from the **current URL** (`isSecureContext`), n
 
 ## Security and integration limits
 
-Named HTTP routes, the existing and later registered SPA fallback, and all registered upgrades, including `/api/remote.mux`, are wrapped synchronously through the current official WebServer route Maps and configurable fallback seat. New registrations and same-path replacements are covered; disposal restores current owners. Unknown structures and duplicate installation fail closed. Direct handler mutation and replacement of the Maps are unsupported. This private adapter is version dependent; it is not a supported public Host middleware interface. Configured `excludePrefixes` cannot exempt business routes; only built-in assets and plugin bundles are anonymously readable after IP and entry fences.
+Named HTTP routes, existing/later SPA fallback and registered upgrades are wrapped
+through the audited WebServer Maps and fallback seat. New registrations through
+the public registration methods are covered. Production disposal retains a
+deny-only guard; a new plugin epoch can reapply to that same listener. Structural
+probe failures refuse activation, but the optional Loader may continue serving
+the listener. Direct handler/Map/descriptor mutation and new dispatch carriers
+remain unsupported and may bypass the guard before integrity diagnostics detect
+them. This adapter is version dependent and is not public Host middleware.
+Configured `excludePrefixes` cannot exempt business routes. Only the configured
+exact login stylesheet GET/HEAD path is eligible for public reading.
 
 `password-native-v1` accepts an ordinary origin and password. Successful setup/password/passkey/key login returns two independent Set-Cookie headers: `dsh_gate_token` and the official authority-bound `dsh-auth-*` cookie. The trusted plugin uses only public `connection.requestRejection`, `authenticatedUrl`, and `authorizeIndex` in memory; the official owner mints and verifies its cookie. No internal token URL is sent to the client or requested over the network. External root/index token links redirect clean to `/` without exchanging them. Anonymous root/index serves a self-contained password page. `auth/me` exposes both `authenticated` and `nativeAuthenticated`; protected business requires both identities. Logout removes both cookies and revokes the gate, including active sockets. API/peer Bearer credentials remain operator credentials with no device scope. `/status.auth` advertises the password bridge separately from `deviceIntegration.ready=false`.
 

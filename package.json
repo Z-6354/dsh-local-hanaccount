@@ -20,8 +20,18 @@
   ],
   "scripts": {
     "test": "node --test",
+    "test:official": "node scripts/probe-isolated-host.mjs",
     "test:attack": "node --test test/attack-sim.test.js",
     "simulate-attacks": "node scripts/simulate-attacks.mjs"
+  },
+  "hanaccountCompatibility": {
+    "adapterId": "dsh-0a15e36-web-auth-v1",
+    "auditedOfficialCommit": "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d",
+    "officialWebServer": "0.1.6-alpha.1 source",
+    "officialConnection": "0.1.6-alpha.1 source",
+    "cordis": "4.0.2 source",
+    "testedNode": "24.19.0",
+    "publicDeploymentVerified": false
   },
   "keywords": [
     "dsh",

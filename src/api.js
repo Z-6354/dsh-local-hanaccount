@@ -26,7 +26,7 @@ import {
   verifyRegistration,
 } from './lib/passkey.js'
 
-export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAuthentication }) {
+export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAuthentication, securityState, isCurrent = () => true, onSecurityFailure }) {
   const challenges = createChallengeStore()
   const pairFailures = new Map()
   const PAIR_FAIL_LIMIT = 10
@@ -63,7 +63,13 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
     return !!req.socket?.encrypted || (store.cfg.trustProxy && detectProxy(req).viaTrustedProxy && req.headers?.['x-forwarded-proto'] === 'https')
   }
 
+  function assertLive() {
+    store.assertActive?.()
+    if (!isCurrent()) throw Object.assign(new Error('auth_unavailable'), {status:503, code:'auth_unavailable'})
+  }
+
   function grant(req, res, extra = {}, expectedVersion = store.cfg.passwordHash, identityValid = () => true) {
+    assertLive()
     if (!bridge) throw Object.assign(new Error('native_bridge_unavailable'), {status:503, code:'native_bridge_unavailable'})
     if (expectedVersion !== store.cfg.passwordHash) throw Object.assign(new Error('native_bridge_unavailable'), {status:503, code:'native_bridge_unavailable'})
     if (!identityValid()) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
@@ -80,7 +86,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
 
   function requireAuth(req, res) {
     const token = authToken(req)
-    if (!store.sessionFromToken(token)) {
+    if (!store.sessionFromToken(token) || (bridge && !bridge.authenticated(req))) {
       sendJson(res, 401, { error: 'login required' })
       return null
     }
@@ -94,7 +100,24 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
   }
 
   return async (req, res) => {
+    let authenticatedToken
+    const authenticationVersion = store.cfg.passwordHash
+    function revalidate() {
+      assertLive()
+      bridge?.fence(req)
+      if (gate.ipContext(req).verdict.action === 'block') throw Object.assign(new Error('access_denied'), {status:403, code:'access_denied'})
+      if (store.cfg.passwordHash !== authenticationVersion) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
+      if (authenticatedToken && (!store.sessionFromToken(authenticatedToken, {touch:false}) || (bridge && !bridge.authenticated(req)))) {
+        throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
+      }
+    }
+    async function readOperationBody() {
+      const body = await readBody(req)
+      revalidate()
+      return body
+    }
     try {
+      assertLive()
       const url = new URL(req.url ?? '/', 'http://x')
       const sub = url.pathname.slice(API_PREFIX.length).replace(/^\/+/, '')
       bridge?.fence(req)
@@ -127,6 +150,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
           passkey,
           routePolicy: store.publicConfig().routePolicy,
           auth: { protocol: AUTH_PROTOCOL, passwordOnly: !!bridge, nativeSessionBridge: !!bridge },
+          security: securityState?.() || {ready:false, deploymentReady:false, code:'isolated_fixture'},
           deviceIntegration: { ready: false, nativeAuthBridge: false, scopedCredentials: false, durableNotifications: false },
         })
         return
@@ -159,7 +183,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
           sendJson(res, 429, { error: 'too many pairing attempts' })
           return
         }
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const result = store.peers.claimPairingCode({
           code: body.code,
           peerName: body.peerName || body.name,
@@ -187,7 +211,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
           sendJson(res, 400, { error: 'password already configured' })
           return
         }
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const password = String(body.password ?? '')
         if (store.cfg.passwordHash) throw httpError(409, 'password already configured')
         if (password.length < 8) throw httpError(400, 'password must be at least 8 characters')
@@ -201,14 +225,16 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
           sendJson(res, 400, { error: 'password_not_configured', code: 'password_not_configured' })
           return
         }
+        const loginVersion = store.cfg.passwordHash
         const lockout = store.getLockout(ip)
         const lock = checkLockout(lockout, store.cfg.lockout)
         if (lock.locked) {
           sendJson(res, 429, { error: 'rate_limited', code: 'rate_limited', retryAfterSec: lock.retryAfterSec })
           return
         }
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const password = String(body.password ?? '')
+        if (store.cfg.passwordHash !== loginVersion) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
         if (!verifyPassword(password, store.cfg.passwordHash)) {
           const fail = recordFailedAttempt(lockout, ip, store.cfg.lockout)
           if (!whitelisted) gate.recordIfSuspicious(ip, fail.reason, req, { whitelisted })
@@ -239,18 +265,21 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'auth/passkey/login/options') {
-        const options = await authenticationOptions(req, store.passkeys)
+        const options = await authenticationOptions(req, store.passkeys, revalidate)
+        revalidate()
         sendJson(res, 200, options)
         return
       }
 
       if (req.method === 'POST' && sub === 'auth/passkey/login/verify') {
         const version = store.cfg.passwordHash
-        const body = await readBody(req)
+        const body = await readOperationBody()
         let authenticatedCredential
         try {
-          authenticatedCredential = await verifyPasskey(req, store.passkeys, body)
+          authenticatedCredential = await verifyPasskey(req, store.passkeys, body, undefined, revalidate)
+          revalidate()
         } catch (e) {
+          revalidate()
           if (!whitelisted) gate.recordIfSuspicious(ip, 'login_failed', req, { whitelisted })
           throw e
         }
@@ -266,7 +295,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
           sendJson(res, 400, { error: 'key auth disabled' })
           return
         }
-        const body = await readBody(req)
+        const body = await readOperationBody()
         if (!store.cfg.keyAuthEnabled) throw Object.assign(new Error('key_auth_disabled'), {status:401, code:'key_auth_disabled'})
         const consumed = challenges.consume(body.challengeId, body.signature)
         if (!consumed.ok) {
@@ -286,6 +315,8 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
 
       const token = requireAuth(req, res)
       if (!token) return
+      authenticatedToken = token
+      revalidate()
 
       if (req.method === 'GET' && sub === 'config') {
         sendJson(res, 200, store.publicConfig())
@@ -293,7 +324,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'PUT' && sub === 'config') {
-        const body = await readBody(req)
+        const body = await readOperationBody()
         if (body.password) {
           if (String(body.password).length < 8) throw httpError(400, 'password must be at least 8 characters')
           store.setPasswordHash(hashPassword(body.password))
@@ -334,14 +365,16 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'auth/passkey/register/options') {
-        const options = await registrationOptions(req, store.passkeys)
+        const options = await registrationOptions(req, store.passkeys, revalidate)
+        revalidate()
         sendJson(res, 200, options)
         return
       }
 
       if (req.method === 'POST' && sub === 'auth/passkey/register/verify') {
-        const body = await readBody(req)
-        const row = await verifyRegistration(req, store.passkeys, body)
+        const body = await readOperationBody()
+        const row = await verifyRegistration(req, store.passkeys, body, revalidate)
+        revalidate()
         sendJson(res, 200, { ok: true, passkey: { id: row.id, name: row.name } })
         return
       }
@@ -371,7 +404,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'keys') {
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const keys = loadAuthorizedKeys(store.keysFile)
         const next = addPublicKey(keys, body.publicKey || body.line || '')
         saveAuthorizedKeys(store.keysFile, next)
@@ -400,7 +433,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'peers/connect') {
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const remoteBaseUrl = store.peers.normalizeBaseUrl(body.remoteBaseUrl || body.baseUrl)
         const code = String(body.code ?? '').trim()
         if (!remoteBaseUrl || !code) throw httpError(400, 'remoteBaseUrl and code are required')
@@ -413,7 +446,9 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
             peerBaseUrl: body.localBaseUrl || body.peerBaseUrl || '',
           }),
         })
+        revalidate()
         const pairBody = await pairRes.json().catch(() => ({}))
+        revalidate()
         if (!pairRes.ok || !pairBody?.token) {
           sendJson(res, pairRes.status || 502, { error: pairBody?.error || 'pairing failed' })
           return
@@ -444,7 +479,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'api-tokens') {
-        const body = await readBody(req)
+        const body = await readOperationBody()
         const created = store.tokens.createApiToken(body.name)
         sendJson(res, 200, { ok: true, token: created })
         return
@@ -463,6 +498,7 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
 
       sendJson(res, 404, { error: 'not found' })
     } catch (err) {
+      if (err?.code === 'storage_unavailable') onSecurityFailure?.()
       sendJson(res, err?.status || 500, { error: err?.code || (err?.status ? String(err.message) : 'internal_error'), code: err?.code || (err?.status === 403 ? 'access_denied' : 'internal_error') }, [408, 413].includes(err?.status) ? {connection:'close'} : {})
     }
   }

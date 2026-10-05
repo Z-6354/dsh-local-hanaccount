@@ -11,33 +11,138 @@ window.__ModuleLoader__.load({
     const API = '/dsh-local-hanaccount/api'
     const STYLE_ID = 'dsh-local-hanaccount-css-v12'
 
+    const AUTH_STATUS = {
+      unknown: 'unknown',
+      checking: 'checking',
+      authenticated: 'authenticated',
+      unauthenticated: 'unauthenticated',
+      unavailable: 'unavailable',
+    }
     const listeners = new Set()
-    const state = { me: null, loading: true }
+    const session = createAuthSession()
+    const state = { me: null, loading: true, auth: session.snapshot() }
     function emit() { for (const fn of listeners) fn({ ...state }) }
     function setState(patch) { Object.assign(state, patch); emit() }
-
-    async function api(path, options) {
-      const res = await fetch(API + path, {
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json', ...(options?.headers || {}) },
-        ...options,
-      })
-      const text = await res.text()
-      let data = {}
-      try { data = text ? JSON.parse(text) : {} } catch { data = { error: text } }
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-      return data
+    function publishSession() {
+      const auth = session.snapshot()
+      setState({ me: auth.me, loading: auth.loading, auth })
     }
 
-    async function refreshMe(opts) {
-      const quiet = !!(opts && opts.quiet) || !!(state.me && state.me.authenticated)
-      if (!quiet) setState({ loading: true })
-      try {
-        const me = await api('/auth/me')
-        setState({ me, loading: false })
-      } catch (err) {
-        setState({ me: { authenticated: false, error: String(err.message || err) }, loading: false })
+    function classifyMeResponse(me) {
+      if (me?.nginxMisconfig?.misconfigured) return { status: AUTH_STATUS.unavailable, reason: 'nginx', substatus: null, me }
+      if (me && me.authenticated === true && me.nativeAuthenticated === true) return { status: AUTH_STATUS.authenticated, reason: 'ok', substatus: null, me }
+      if (me && me.authenticated === true && me.nativeAuthenticated !== true) return { status: AUTH_STATUS.unavailable, reason: 'nativeMissing', substatus: 'nativeMissing', me }
+      if (me && (me.authenticated === false || me.passwordConfigured === false)) {
+        return { status: AUTH_STATUS.unauthenticated, reason: me.passwordConfigured === false ? 'setup_required' : 'unauthenticated', substatus: null, me }
       }
+      return { status: AUTH_STATUS.unavailable, reason: 'malformed', substatus: null, me }
+    }
+    function classifyMeFailure(error) {
+      const statusCode = Number(error?.status) || 0
+      const name = error?.name || ''
+      if (name === 'AbortError' || name === 'TimeoutError') return { status: AUTH_STATUS.unavailable, reason: 'timeout', substatus: null, me: null }
+      if (statusCode === 401 || statusCode === 403) return { status: AUTH_STATUS.unauthenticated, reason: `http_${statusCode}`, substatus: null, me: null }
+      if (statusCode === 502 || statusCode === 503 || statusCode === 504) return { status: AUTH_STATUS.unavailable, reason: `http_${statusCode}`, substatus: null, me: null }
+      return { status: AUTH_STATUS.unavailable, reason: 'network', substatus: null, me: null }
+    }
+    function loginGateDecision(snapshot) {
+      if (!snapshot || snapshot.status === AUTH_STATUS.unknown || snapshot.status === AUTH_STATUS.checking) return { overlay: 'loading', redirect: false }
+      if (snapshot.me?.nginxMisconfig?.misconfigured) return { overlay: 'nginx', redirect: false }
+      if (snapshot.status === AUTH_STATUS.unavailable) return { overlay: 'unavailable', redirect: false }
+      if (snapshot.status === AUTH_STATUS.unauthenticated) {
+        return { overlay: snapshot.redirectsRemaining > 0 ? null : 'unauthenticated', redirect: snapshot.redirectsRemaining > 0 }
+      }
+      return { overlay: null, redirect: false }
+    }
+    function createAuthSession() {
+      let status = AUTH_STATUS.unknown, reason = null, substatus = null, me = null, lastConfirmed = null, version = 0, inflight = null, redirectsUsed = 0, controller = null
+      function snapshot() {
+        return { status, reason, substatus, me, lastConfirmed, loading: status === AUTH_STATUS.unknown || status === AUTH_STATUS.checking, redirectsRemaining: Math.max(0, 1 - redirectsUsed) }
+      }
+      function apply(classified) {
+        if (classified.status === AUTH_STATUS.unavailable) {
+          status = AUTH_STATUS.unavailable
+          reason = classified.reason
+          substatus = classified.substatus
+          if (classified.me) me = classified.me
+          return
+        }
+        status = classified.status
+        reason = classified.reason
+        substatus = classified.substatus
+        me = classified.me
+        lastConfirmed = classified
+      }
+      async function refresh() {
+        if (inflight) return inflight
+        const mine = ++version
+        if (status !== AUTH_STATUS.authenticated) status = AUTH_STATUS.checking
+        publishSession()
+        controller = typeof AbortController === 'function' ? new AbortController() : null
+        const timer = controller ? setTimeout(() => controller.abort(), 5000) : null
+        inflight = (async () => {
+          try {
+            const body = await api('/auth/me', { signal: controller?.signal })
+            if (mine !== version) return snapshot()
+            apply(classifyMeResponse(body))
+          } catch (error) {
+            if (mine !== version) return snapshot()
+            apply(classifyMeFailure(error))
+          } finally {
+            if (timer) clearTimeout(timer)
+            if (mine === version) inflight = null
+          }
+          publishSession()
+          return snapshot()
+        })()
+        return inflight
+      }
+      function noteRedirect() {
+        if (status !== AUTH_STATUS.unauthenticated || redirectsUsed >= 1) return false
+        redirectsUsed += 1
+        return true
+      }
+      function dispose() {
+        version += 1
+        inflight = null
+        controller?.abort()
+      }
+      return { refresh, snapshot, noteRedirect, dispose }
+    }
+
+    async function api(path, options) {
+      const timeout = new AbortController()
+      const timer = setTimeout(() => timeout.abort(), 5000)
+      const onAbort = () => timeout.abort()
+      if (options?.signal) {
+        if (options.signal.aborted) timeout.abort()
+        else options.signal.addEventListener('abort', onAbort)
+      }
+      try {
+        const res = await fetch(API + path, {
+          credentials: 'same-origin',
+          headers: { 'content-type': 'application/json', ...(options?.headers || {}) },
+          ...options,
+          signal: timeout.signal,
+        })
+        const text = await res.text()
+        let data = {}
+        try { data = text ? JSON.parse(text) : {} } catch {
+          throw Object.assign(new Error('invalid_json'), { status: res.status })
+        }
+        if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, code: data.code })
+        return data
+      } catch (error) {
+        if (error?.name === 'AbortError') throw Object.assign(new Error('timeout'), { name: 'TimeoutError' })
+        throw error
+      } finally {
+        clearTimeout(timer)
+        options?.signal?.removeEventListener?.('abort', onAbort)
+      }
+    }
+
+    async function refreshMe() {
+      return session.refresh()
     }
 
     function clientPasskeyReady() {
@@ -255,7 +360,7 @@ window.__ModuleLoader__.load({
 .dsh-lha-dialog h4{margin:0;font-size:16px;line-height:24px;font-weight:500}
 .dsh-lha-dialog p{margin:0;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap}
 .dsh-lha-dialog__foot{display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap}
-[data-lha-chip]{display:inline-flex;gap:6px;align-items:center;padding:5px 9px;font-size:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-layer-2);cursor:pointer;font-family:inherit;color:var(--dsw-alias-label-primary)}
+[data-lha-chip]{min-height:44px;display:inline-flex;gap:6px;align-items:center;padding:5px 9px;font-size:12px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-layer-2);cursor:pointer;font-family:inherit;color:var(--dsw-alias-label-primary)}
 `
     }
 
@@ -290,10 +395,11 @@ window.__ModuleLoader__.load({
     function LoginGate() {
       const snap = useSharedState()
       React.useEffect(ensureStyle, [])
+      const decision = loginGateDecision(snap.auth || session.snapshot())
       React.useEffect(() => {
-        if (!snap.loading && !snap.me?.nginxMisconfig?.misconfigured && (!snap.me?.passwordConfigured || !snap.me?.authenticated || !snap.me?.nativeAuthenticated)) window.location.replace('/')
-      }, [snap.loading, snap.me])
-      if (snap.loading) {
+        if (decision.redirect && session.noteRedirect()) window.location.replace('/')
+      }, [decision.redirect])
+      if (decision.overlay === 'loading') {
         return jsx(AuthOverlay, { children: jsxs('div', { 'data-lha-content': '', children: [
           jsxs('div', { 'data-lha-loading': '', children: [
             jsx('span', { 'data-lha-spinner': '' }),
@@ -301,8 +407,22 @@ window.__ModuleLoader__.load({
           ] }),
         ] }) })
       }
-      if (snap.me?.nginxMisconfig?.misconfigured) {
+      if (decision.overlay === 'nginx') {
         return jsx(AuthOverlay, { children: jsx(NginxMisconfigCard, { info: snap.me.nginxMisconfig }) })
+      }
+      if (decision.overlay === 'unavailable' || decision.overlay === 'unauthenticated') {
+        const nativeMissing = snap.auth?.substatus === 'nativeMissing'
+        const title = decision.overlay === 'unauthenticated' ? '需要重新登录' : '访问检查暂时不可用'
+        const detail = nativeMissing
+          ? '账户有效，但官方会话未能恢复。请重试，不要刷新整页。'
+          : (decision.overlay === 'unauthenticated' ? '登录已失效。请打开登录页后继续。' : '网络或服务器暂时不可用。已保留上次确认的身份，需要认证的操作已暂停。')
+        return jsx(AuthOverlay, { children: jsxs('div', { 'data-lha-content': '', children: [
+          jsx('h2', { 'data-lha-title': '', children: title }),
+          jsx('p', { 'data-lha-desc': '', children: detail }),
+          jsxs('div', { 'data-lha-footer': '', children: [
+            jsx('button', { type: 'button', 'data-lha-btn': '', className: 'primary', onClick: () => refreshMe(), children: '重试' }),
+          ] }),
+        ] }) })
       }
       return null
     }
@@ -729,6 +849,7 @@ window.__ModuleLoader__.load({
         if (status?.nginxMisconfig?.misconfigured) {
           return jsxs('div', { className: 'dsh-lha-root', children: [
             jsx('h2', { className: 'dsh-lha-heading', children: '访问控制' }),
+        jsx(LogoutButton, {}),
             jsx(NginxMisconfigCard, { info: status.nginxMisconfig }),
           ] })
         }
@@ -824,6 +945,7 @@ window.__ModuleLoader__.load({
 
       return jsxs('div', { className: 'dsh-lha-root', children: [
         jsx('h2', { className: 'dsh-lha-heading', children: '访问控制' }),
+        jsx(LogoutButton, {}),
         status?.nginxMisconfig?.misconfigured ? jsx('div', { className: 'dsh-lha-banner dsh-lha-banner--error', children: status.nginxMisconfig.message }) : null,
         msg ? jsx('div', { className: 'dsh-lha-banner dsh-lha-banner--ok', children: msg }) : null,
         err ? jsx('div', { className: 'dsh-lha-banner dsh-lha-banner--error', children: err }) : null,
@@ -1031,13 +1153,16 @@ window.__ModuleLoader__.load({
       ] })
     }
 
-    function HeaderChip() {
+    function LogoutButton() {
       const snap = useSharedState()
       React.useEffect(ensureStyle, [])
       if (!snap.me?.authenticated) return null
       return jsx('button', { 'data-lha-chip': '', type: 'button', onClick: async () => {
-        await api('/auth/logout', { method: 'POST', body: '{}' })
-        window.location.replace('/')
+        try {
+          await api('/auth/logout', { method: 'POST', body: '{}' })
+          try { window.localStorage.setItem('lha-auto-login-disabled', '1') } catch {}
+          window.location.replace('/')
+        } catch { window.alert('退出失败，请重试。') }
       }, children: '退出访问控制' })
     }
 
@@ -1045,7 +1170,6 @@ window.__ModuleLoader__.load({
       ensureStyle()
       ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'dsh-local-hanaccount-gate', order: -1000 }, LoginGate)), 'dsh-local-hanaccount: gate')
       ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'dsh-local-hanaccount-settings', order: 15, label: '访问控制' }, GateSettingsSection)), 'dsh-local-hanaccount: settings')
-      ctx.effect(() => ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({ name: 'conversation.session.header.actions', id: 'dsh-local-hanaccount-chip', order: -10 }, HeaderChip)), 'dsh-local-hanaccount: chip')
       refreshMe()
     }
 

@@ -34,7 +34,16 @@ function ensureLoopbackAllow(allow, deny) {
   return out
 }
 
-export function createStore(initialConfig = {}) {
+export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
+  let active = true
+  function assertActive() {
+    if (!active) throw Object.assign(new Error('auth_unavailable'), {status:503, code:'auth_unavailable'})
+  }
+  function storageFailure() { active = false; onStorageFailure?.() }
+  function guarded(method) { return (...args) => { assertActive(); return method(...args) } }
+  function guardedStore(child) {
+    return Object.fromEntries(Object.entries(child).map(([key,value]) => [key, typeof value === 'function' ? guarded(value) : value]))
+  }
   const dataDir = resolve(initialConfig.dataDir || defaultDataDir())
   mkdirSync(dataDir, { recursive: true })
   const configFile = join(dataDir, 'config.json')
@@ -70,16 +79,17 @@ export function createStore(initialConfig = {}) {
   if (!state.sessions) state.sessions = {}
   if (!state.lockouts) state.lockouts = {}
 
-  const visitors = createVisitorsStore(dataDir)
-  const passkeys = createPasskeyStore(dataDir)
+  const visitors = guardedStore(createVisitorsStore(dataDir))
   const securityListeners = new Set()
   const securityChanged = () => { for (const listener of securityListeners) listener() }
-  const tokens = createTokenStore(dataDir, securityChanged)
-  const peers = createPeersStore(dataDir, securityChanged)
+  const passkeys = createPasskeyStore(dataDir, securityChanged, {assertActive,onStorageFailure:storageFailure})
+  const tokens = createTokenStore(dataDir, securityChanged, {assertActive,onStorageFailure:storageFailure})
+  const peers = createPeersStore(dataDir, securityChanged, {assertActive,onStorageFailure:storageFailure})
   const keysFile = join(dataDir, 'authorized_keys')
 
   function saveConfig() {
-    writeJson(configFile, {
+    assertActive()
+    try { writeJson(configFile, {
       passwordHash: cfg.passwordHash,
       allow: cfg.allow,
       deny: cfg.deny,
@@ -89,13 +99,15 @@ export function createStore(initialConfig = {}) {
       sessionMaxAgeDays: cfg.sessionMaxAgeDays,
       lockout: cfg.lockout,
       routePolicy: { ...cfg.routePolicy, excludePrefixes: [...cfg.routePolicy.excludePrefixes] },
-    })
+    }) } catch { storageFailure(); throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'}) }
   }
 
   if (needsConfigRepair) saveConfig()
 
   function saveState() {
-    writeJson(stateFile, state)
+    assertActive()
+    try { writeJson(stateFile, state) }
+    catch { storageFailure(); throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'}) }
   }
 
   function publicConfig() {
@@ -159,8 +171,7 @@ export function createStore(initialConfig = {}) {
     const seen = Date.parse(s.lastSeenAt)
     if (s.authVersion !== authVersion() || !Number.isFinite(created) || !Number.isFinite(seen) || Date.now() - created >= ttl || Date.now() - seen >= ttl) {
       delete state.sessions[t]
-      saveState()
-      securityChanged()
+      try { saveState() } finally { securityChanged() }
       return null
     }
     if (touch) s.lastSeenAt = nowIso()
@@ -170,8 +181,7 @@ export function createStore(initialConfig = {}) {
   function logout(token) {
     if (token && state.sessions[token]) {
       delete state.sessions[token]
-      saveState()
-      securityChanged()
+      try { saveState() } finally { securityChanged() }
     }
   }
 
@@ -190,13 +200,15 @@ export function createStore(initialConfig = {}) {
     tokens,
     peers,
     publicConfig,
-    updateConfig,
-    setPasswordHash,
-    issueSession,
-    sessionFromToken,
-    logout,
-    getLockout,
-    saveState,
+    updateConfig: guarded(updateConfig),
+    setPasswordHash: guarded(setPasswordHash),
+    issueSession: guarded(issueSession),
+    sessionFromToken: guarded(sessionFromToken),
+    logout: guarded(logout),
+    getLockout: guarded(getLockout),
+    saveState: guarded(saveState),
+    assertActive,
+    retire() { active = false },
     onSecurityChange(listener) { securityListeners.add(listener); return () => securityListeners.delete(listener) },
   }
 }

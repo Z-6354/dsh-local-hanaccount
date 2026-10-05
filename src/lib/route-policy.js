@@ -2,8 +2,8 @@ import { normalizeStringList } from './util.js'
 
 export const ROUTE_MODE_PROTECT_ALL = 'protect-all'
 
-/** Public static paths — client bundles must load before the login UI can run. */
-export const BUILTIN_AUTH_EXCLUDE_PREFIXES = ['/plugins', '/assets']
+/** Prefix names do not establish static ownership. Login runs without bundles. */
+export const BUILTIN_AUTH_EXCLUDE_PREFIXES = []
 
 export function normalizeRoutePath(path) {
   const raw = String(path ?? '').trim()

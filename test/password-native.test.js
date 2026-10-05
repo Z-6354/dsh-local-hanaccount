@@ -81,3 +81,13 @@ test('passkey verification rejects a counter update that fails after successful 
 test('final passkey grant rechecks same stored identity after await',()=>fixture(async f=>{
  const stored=f.store.passkeys.addCredential({credentialId:'fixture',publicKey:'ZmFrZQ'});let entered,release;const reached=new Promise(resolve=>{entered=resolve});const waiting=new Promise(resolve=>{release=resolve});const req=Readable.from(['{}']);Object.assign(req,{method:'POST',url:'/dsh-local-hanaccount/api/auth/passkey/login/verify',headers:{host:'localhost','content-type':'application/json'},socket:{remoteAddress:'127.0.0.1'}});let status,headers;const pending=createApiHandler({...f,verifyPasskey:async()=>{entered();await waiting;return stored}})(req,{writeHead(s,h){status=s;headers=h},end(){}});await reached;f.store.passkeys.removeCredential(stored.id);release();await pending;assert.equal(status,401);assert.equal(headers['set-cookie'],undefined);assert.deepEqual(f.store.state.sessions,{})
 }))
+
+
+test('persistent valid session restores official browser identity without password login',()=>fixture(({store,gate})=>{
+ const token=store.issueSession();let status,headers,body
+ gate.wrapHttpHandler(()=>{throw Error('must redirect before SPA')})({method:'GET',url:'/',headers:{host:'localhost',cookie:`dsh_gate_token=${token}`},socket:{remoteAddress:'127.0.0.1'}},{writeHead(s,h){status=s;headers=h},end(b){body=b}})
+ assert.equal(status,303);assert.equal(headers.location,'/');assert.match(headers['set-cookie'],/^dsh-auth-fixture=native/)
+ store.logout(token)
+ gate.wrapHttpHandler(()=>{throw Error('revoked identity must not reach SPA')})({method:'GET',url:'/',headers:{host:'localhost',cookie:`dsh_gate_token=${token}`},socket:{remoteAddress:'127.0.0.1'}},{writeHead(s,h){status=s;headers=h},end(b){body=b}})
+ assert.equal(status,200);assert.equal(headers['set-cookie'],undefined);assert.match(body,/登录/)
+}))

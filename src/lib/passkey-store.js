@@ -7,14 +7,26 @@ function emptyFile() {
   return { version: 1, credentials: [], challenges: {} }
 }
 
-export function createPasskeyStore(dataDir) {
+export function createPasskeyStore(dataDir, securityChanged = () => {}, {assertActive = () => {}, onStorageFailure = () => {}} = {}) {
+  let failed = false
+  function assertUsable() {
+    if (failed) throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    assertActive()
+  }
+  const guarded = method => (...args) => {assertUsable(); return method(...args)}
   const file = join(dataDir, 'passkeys.json')
   let data = readJson(file, emptyFile())
   if (!Array.isArray(data.credentials)) data.credentials = []
   if (!data.challenges || typeof data.challenges !== 'object') data.challenges = {}
 
   function save() {
-    writeJson(file, data)
+    assertUsable()
+    try { writeJson(file, data) }
+    catch {
+      failed = true
+      try { onStorageFailure() } finally { securityChanged() }
+      throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    }
   }
 
   function purgeChallenges() {
@@ -79,7 +91,9 @@ export function createPasskeyStore(dataDir) {
   function removeCredential(entryId) {
     const before = data.credentials.length
     data.credentials = data.credentials.filter((c) => c.id !== entryId)
-    if (data.credentials.length !== before) save()
+    if (data.credentials.length !== before) {
+      try { save() } finally { securityChanged() }
+    }
     return before !== data.credentials.length
   }
 
@@ -93,14 +107,14 @@ export function createPasskeyStore(dataDir) {
 
   return {
     file,
-    listPublic,
-    listForAuth,
-    findByCredentialId,
-    addCredential,
-    removeCredential,
-    updateCounter,
-    setChallenge,
-    takeChallenge,
-    count: () => data.credentials.length,
+    listPublic: guarded(listPublic),
+    listForAuth: guarded(listForAuth),
+    findByCredentialId: guarded(findByCredentialId),
+    addCredential: guarded(addCredential),
+    removeCredential: guarded(removeCredential),
+    updateCounter: guarded(updateCounter),
+    setChallenge: guarded(setChallenge),
+    takeChallenge: guarded(takeChallenge),
+    count: guarded(() => data.credentials.length),
   }
 }

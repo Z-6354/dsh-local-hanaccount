@@ -10,14 +10,26 @@ export function issueToken() {
   return randomBytes(32).toString('hex')
 }
 
-export function createTokenStore(dataDir, securityChanged = () => {}) {
+export function createTokenStore(dataDir, securityChanged = () => {}, {assertActive = () => {}, onStorageFailure = () => {}} = {}) {
+  let failed = false
+  function assertUsable() {
+    if (failed) throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    assertActive()
+  }
+  const guarded = method => (...args) => {assertUsable(); return method(...args)}
   const apiTokensFile = join(dataDir, 'api-tokens.json')
 
   let apiState = readJson(apiTokensFile, { version: 1, tokens: [] })
   if (!Array.isArray(apiState.tokens)) apiState.tokens = []
 
   function saveApiTokens() {
-    writeJson(apiTokensFile, apiState)
+    assertUsable()
+    try { writeJson(apiTokensFile, apiState) }
+    catch {
+      failed = true
+      try { onStorageFailure() } finally { securityChanged() }
+      throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    }
   }
 
   function listApiTokensPublic() {
@@ -47,8 +59,7 @@ export function createTokenStore(dataDir, securityChanged = () => {}) {
     const before = apiState.tokens.length
     apiState.tokens = apiState.tokens.filter((row) => row.id !== tokenId)
     if (apiState.tokens.length === before) return false
-    saveApiTokens()
-    securityChanged()
+    try { saveApiTokens() } finally { securityChanged() }
     return true
   }
 
@@ -77,11 +88,11 @@ export function createTokenStore(dataDir, securityChanged = () => {}) {
   }
 
   return {
-    listApiTokensPublic,
-    createApiToken,
-    revokeApiToken,
-    verifyApiToken,
-    verifyAny,
+    listApiTokensPublic: guarded(listApiTokensPublic),
+    createApiToken: guarded(createApiToken),
+    revokeApiToken: guarded(revokeApiToken),
+    verifyApiToken: guarded(verifyApiToken),
+    verifyAny: guarded(verifyAny),
     hashToken,
     issueToken,
   }

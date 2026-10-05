@@ -15,7 +15,22 @@ function normalizeBaseUrl(raw) {
   return url.toString().replace(/\/$/, '')
 }
 
-export function createPeersStore(dataDir, securityChanged = () => {}) {
+export function createPeersStore(dataDir, securityChanged = () => {}, {assertActive = () => {}, onStorageFailure = () => {}} = {}) {
+  let failed = false
+  function assertUsable() {
+    if (failed) throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    assertActive()
+  }
+  const guarded = method => (...args) => {assertUsable(); return method(...args)}
+  function persist(file, state) {
+    assertUsable()
+    try { writeJson(file, state) }
+    catch {
+      failed = true
+      try { onStorageFailure() } finally { securityChanged() }
+      throw Object.assign(new Error('storage_unavailable'), {status:503, code:'storage_unavailable'})
+    }
+  }
   const peersFile = join(dataDir, 'peers.json')
   const pairingFile = join(dataDir, 'pairing-codes.json')
 
@@ -26,11 +41,11 @@ export function createPeersStore(dataDir, securityChanged = () => {}) {
   if (!Array.isArray(pairingState.codes)) pairingState.codes = []
 
   function savePeers() {
-    writeJson(peersFile, state)
+    persist(peersFile, state)
   }
 
   function savePairing() {
-    writeJson(pairingFile, pairingState)
+    persist(pairingFile, pairingState)
   }
 
   function prunePairingCodes() {
@@ -91,8 +106,7 @@ export function createPeersStore(dataDir, securityChanged = () => {}) {
     const before = state.peers.length
     state.peers = state.peers.filter((row) => row.id !== peerId)
     if (state.peers.length === before) return false
-    savePeers()
-    securityChanged()
+    try { savePeers() } finally { securityChanged() }
     return true
   }
 
@@ -148,6 +162,7 @@ export function createPeersStore(dataDir, securityChanged = () => {}) {
         name: row.name,
         hash: row.inboundTokenHash,
         onUse: () => {
+          assertUsable()
           if (row.lastUsedAt && Date.now() - Date.parse(row.lastUsedAt) < 60000) return
           row.lastUsedAt = nowIso()
           savePeers()
@@ -177,15 +192,15 @@ export function createPeersStore(dataDir, securityChanged = () => {}) {
   }
 
   return {
-    listPeersPublic,
-    getPeer,
-    addOutboundPeer,
-    addInboundPeer,
-    removePeer,
-    createPairingCode,
-    claimPairingCode,
-    inboundVerifierEntries,
-    matchUrl,
+    listPeersPublic: guarded(listPeersPublic),
+    getPeer: guarded(getPeer),
+    addOutboundPeer: guarded(addOutboundPeer),
+    addInboundPeer: guarded(addInboundPeer),
+    removePeer: guarded(removePeer),
+    createPairingCode: guarded(createPairingCode),
+    claimPairingCode: guarded(claimPairingCode),
+    inboundVerifierEntries: guarded(inboundVerifierEntries),
+    matchUrl: guarded(matchUrl),
     normalizeBaseUrl,
   }
 }

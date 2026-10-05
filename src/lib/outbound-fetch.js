@@ -1,18 +1,19 @@
+let installation
 export function installOutboundFetch(peersStore) {
-  if (globalThis.__dshHcFetchPatched) {
-    return globalThis.__dshHcFetchRestore || (() => {})
-  }
+  if (installation) throw new Error('outbound enhancement already installed')
 
-  const original = globalThis.fetch?.bind(globalThis)
+  const original = globalThis.fetch
   if (typeof original !== 'function') {
     return () => {}
   }
 
+  let active = true
   async function patchedFetch(input, init = {}) {
+    if (!active) return original.call(globalThis, input, init)
     const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input?.url
     const peer = url ? peersStore.matchUrl(url) : null
     if (!peer?.outboundToken) {
-      return original(input, init)
+      return original.call(globalThis, input, init)
     }
 
     const headers = new Headers(
@@ -24,21 +25,20 @@ export function installOutboundFetch(peersStore) {
 
     if (typeof Request !== 'undefined' && input instanceof Request) {
       const next = new Request(input, { ...init, headers })
-      return original(next)
+      return original.call(globalThis, next)
     }
 
-    return original(input, { ...init, headers })
+    return original.call(globalThis, input, { ...init, headers })
   }
 
   globalThis.fetch = patchedFetch
-  globalThis.__dshHcFetchPatched = true
+  installation = patchedFetch
 
   const restore = () => {
-    if (!globalThis.__dshHcFetchPatched) return
-    globalThis.fetch = original
-    delete globalThis.__dshHcFetchPatched
-    delete globalThis.__dshHcFetchRestore
+    if (!active) return
+    active = false
+    if (globalThis.fetch === patchedFetch) globalThis.fetch = original
+    if (installation === patchedFetch) installation = undefined
   }
-  globalThis.__dshHcFetchRestore = restore
   return restore
 }
