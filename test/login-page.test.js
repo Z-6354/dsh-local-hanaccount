@@ -10,7 +10,7 @@ test('standalone login emits runnable script with nonce-only assets and previous
   assert.match(html, /<style nonce="test-nonce">/)
   assert.match(html, /data-lha-dialog/)
   assert.match(html, /border-radius:24px/)
-  assert.match(html, /输入访问密码以继续使用 DSH/)
+  assert.match(html, /输入访问密码以继续使用 DSHA/)
   assert.doesNotMatch(html, /\sstyle=|\sonclick=|Harness sign in|\?token=/)
 })
 
@@ -75,12 +75,15 @@ test('previous login form reports refusal and redirects only after successful pa
   assert.equal(JSON.parse(p.requests.at(-1).options.body).password,'fixture-password')
 })
 
-test('unchanged loopback HTTP keeps local setup origin',async()=>{
-  const p=await page({passwordConfigured:false},async()=>({ok:true,json:async()=>({ok:true})}),{location:{hostname:'127.0.0.1',port:'8080',protocol:'http:',origin:'http://127.0.0.1:8080'}})
-  p.element('password').value=p.element('confirm').value='fixture-secret';p.element('password').oninput()
-  assert.equal(p.element('submit').disabled,false)
+test('no password yet: the page explains server-side setup and never offers or sends a browser setup',async()=>{
+  const p=await page({passwordConfigured:false},async()=>assert.fail('no password request may be sent'),{location:{hostname:'127.0.0.1',port:'8080',protocol:'http:',origin:'http://127.0.0.1:8080'}})
+  assert.equal(p.element('title').textContent,'尚未设置访问密码')
+  assert.match(p.element('description').textContent,/DSH_HANACCOUNT_PASSWORD_FILE/)
+  assert.match(p.element('description').textContent,/set-password\.mjs/)
+  assert.equal(p.element('form').hidden,true,'the password form must not be offered')
+  p.element('password').value='fixture-secret';p.element('password').oninput()
   p.element('form').onsubmit({preventDefault(){}});await tick()
-  assert.match(p.requests.at(-1).url,/auth\/setup$/)
+  assert.equal(p.requests.every(r=>!/auth\/(setup|login)$/.test(r.url)),true)
 })
 
 test('editing a target exits Passkey mode and refuses old-server Passkey operations',async()=>{
@@ -98,17 +101,6 @@ test('native remembered password arrives only while the matching target remains 
   await tick();assert.equal(typeof deliverRead,'function')
   p.element('serverHost').value='other.test';p.element('serverHost').oninput();deliverRead();await tick()
   assert.equal(p.element('password').value,'');assert.equal(p.requests.length,1)
-})
-
-test('first setup requires confirmation and uses setup endpoint',async()=>{
-  const p=await page({passwordConfigured:false},async()=>({ok:true,json:async()=>({ok:true})}))
-  assert.equal(p.element('title').textContent,'设置访问密码')
-  p.element('password').value='fixture-password';p.element('password').oninput()
-  assert.equal(p.element('submit').disabled,true)
-  p.element('confirm').value='fixture-password';p.element('confirm').oninput()
-  assert.equal(p.element('submit').disabled,false)
-  p.element('form').onsubmit({preventDefault(){}});await tick()
-  assert.match(p.requests.at(-1).url,/auth\/setup$/)
 })
 
 test('访问检查请求一直挂起时会在超时后揭开登录表单',async()=>{
@@ -240,7 +232,7 @@ test('pending cached auto-login never flashes Cancel or reveals manual controls'
   assert.equal(p.cancelStates.includes(false),false,'Cancel must remain hidden throughout the operation')
 })
 
-for(const setup of [false,true]) test(`manual ${setup?'setup':'login'} shows progress on Continue without a separate Cancel control`,async()=>{
+for(const setup of [false]) test(`manual ${setup?'setup':'login'} shows progress on Continue without a separate Cancel control`,async()=>{
   let finish
   const p=await page({passwordConfigured:!setup},()=>new Promise(resolve=>{finish=resolve}))
   p.element('password').value=p.element('confirm').value='fixture-secret';p.element('password').oninput()

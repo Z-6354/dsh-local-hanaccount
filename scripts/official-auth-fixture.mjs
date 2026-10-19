@@ -143,13 +143,14 @@ try {
   console.log('PASS optional Loader failure: sibling HTTP/Upgrade remains exposed (DEPLOYMENT BLOCKED)')
 } finally {await failed.close()}
 
-const unsupported=await composition(Hanaccount,{officialBuild:'unrecognized-build'})
+const metadataOnly=await composition(Hanaccount,{officialBuild:'unrecognized-build'})
 try {
-  assert.equal(unsupported.auth.fiber.state,FiberState.FAILED)
-  assert.equal((await request(unsupported,'/')).status,200)
-  const nativeBridge=createNativeBridge(unsupported.ctx.connection)
-  const native=nativeBridge.mint({headers:{host:`127.0.0.1:${unsupported.ctx.webServer.port}`},method:'GET',url:'/'}).split(';')[0]
-  assert.equal((await request(unsupported,'/api/business',native)).status,200);nativeBridge.dispose()
-  console.log('PASS unknown build refuses activation; optional Loader still serves sibling fallback (DEPLOYMENT BLOCKED)')
-} finally {await unsupported.close()}
+  assert.notEqual(metadataOnly.auth.fiber.state,FiberState.FAILED)
+  const status=JSON.parse((await request(metadataOnly,'/dsh-local-hanaccount/api/status')).body)
+  assert.equal(status.security.ready,true)
+  assert.equal(status.security.compatibilityMode,'capability-based')
+  assert.equal(status.security.officialBuild,'unrecognized-build')
+  assert.equal((await request(metadataOnly,'/api/business')).status,401)
+  console.log('PASS unknown build metadata activates supported interfaces and retains both-identity guard')
+} finally {await metadataOnly.close()}
 console.log(JSON.stringify({officialBuild:AUDITED_BUILD,adapterId:ADAPTER_ID,node:process.version,cordis:'4.0.2 source',deploymentReady:false}))

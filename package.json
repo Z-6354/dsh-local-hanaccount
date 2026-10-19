@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-hanaccount",
-  "version": "2.4.1",
+  "version": "2.5.0",
   "description": "Access lock for DeepSeek Harness web profile (password, passkey, IP lists, Nginx)",
   "type": "module",
   "main": "./src/index.js",
@@ -14,23 +14,39 @@
   },
   "files": [
     "src",
+    "scripts/set-password.mjs",
+    "scripts/migrate-legacy-sessions.mjs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test",
+    "test": "node scripts/bundle.mjs --check && node --test",
     "test:official": "node scripts/probe-isolated-host.mjs",
     "test:attack": "node --test test/attack-sim.test.js",
-    "simulate-attacks": "node scripts/simulate-attacks.mjs"
+    "simulate-attacks": "node scripts/simulate-attacks.mjs",
+    "build": "node scripts/bundle.mjs"
   },
   "hanaccountCompatibility": {
-    "adapterId": "dsh-0a15e36-web-auth-v1",
-    "auditedOfficialCommit": "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d",
-    "officialWebServer": "0.1.6-alpha.1 source",
-    "officialConnection": "0.1.6-alpha.1 source",
-    "cordis": "4.0.2 source",
-    "testedNode": "24.19.0",
+    "adapterId": "dsh-capability-web-auth-v1",
+    "mode": "capability-based",
+    "connectionMethods": [
+      "requestRejection",
+      "authenticatedUrl",
+      "authorizeIndex"
+    ],
+    "webServerMethods": [
+      "register",
+      "registerUpgrade",
+      "registerFallback"
+    ],
+    "webServerStructure": "writable exact/prefixes/upgrades Maps and supported fallback property",
+    "optionalRpcIdentity": "admit plus browserPeer (rc.2) or legacy operator",
+    "nativeRedirects": [
+      "/",
+      "./"
+    ],
+    "historicalAuditedOfficialCommit": "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d",
     "publicDeploymentVerified": false
   },
   "keywords": [

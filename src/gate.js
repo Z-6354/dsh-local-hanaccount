@@ -1,6 +1,6 @@
 import { detectNginxMisconfig, detectProxy, evaluateIpAccess, ipInList, resolveClientIp } from './lib/ip.js'
 import { loginStyle } from './lib/login-style.js'
-import { parseCookies, sendJson, sendText, COOKIE } from './lib/util.js'
+import { parseCookies, sendJson, sendText, COOKIE, setCookieHeader } from './lib/util.js'
 import { randomBytes } from 'node:crypto'
 import { renderLoginPage } from './lib/login-page.js'
 
@@ -76,13 +76,45 @@ export function createGate(store, bridge) {
 
   function isAuthenticated(req, touch = true) {
     if (disposed) return false
+    // Whitelist 免登录 is implemented by minting a real dual-cookie session on `/`
+    // (see grantWhitelistIdentity). After that, the normal session + native rule applies.
     const gateAuthenticated = isSessionAuthenticated(req, touch) || isBearerAuthenticated(req)
     if (!gateAuthenticated) return false
     try { return !bridge || bridge.authenticated(req) } catch { return false }
   }
 
+  /**
+   * Mint gate + native cookies for a whitelisted IP (免登录).
+   * Injects cookies into this request and Set-Cookie on the response, then falls
+   * through to the home handler — avoids WebView losing Set-Cookie on a same-URL 303.
+   */
+  function grantWhitelistIdentity(req, res) {
+    if (!store.cfg.passwordHash || !bridge) return false
+    const secure = !!req.socket?.encrypted || (store.cfg.trustProxy && detectProxy(req).viaTrustedProxy && req.headers?.['x-forwarded-proto'] === 'https')
+    const native = bridge.mint(req, secure)
+    if (disposed || ipContext(req).verdict.action === 'block' || !ipContext(req).verdict.whitelisted) throw Error('identity_revoked')
+    const token = store.issueSession()
+    const gate = setCookieHeader(token, store.cfg.sessionMaxAgeDays, secure)
+    const gatePair = `${COOKIE}=${encodeURIComponent(token)}`
+    const nativePair = String(native).split(';')[0]
+    const previous = String(req.headers?.cookie || '')
+    req.headers = req.headers || {}
+    req.headers.cookie = [previous, gatePair, nativePair].filter(Boolean).join('; ')
+    const prior = res.getHeader?.('Set-Cookie')
+    const cookies = []
+    if (Array.isArray(prior)) cookies.push(...prior)
+    else if (prior) cookies.push(prior)
+    cookies.push(gate, native)
+    res.setHeader('Set-Cookie', cookies)
+    res.setHeader('cache-control', 'no-store')
+    res.setHeader('referrer-policy', 'no-referrer')
+    return true
+  }
+
   function recordIfSuspicious(ip, reason, req, { whitelisted = false } = {}) {
     if (whitelisted || ipInList(ip, store.cfg.allow)) return
+    // IPv6 sources are rejected wholesale: recording each one would let address rotation drive fsync writes.
+    if (reason === 'ipv6_not_supported' || reason === 'no_client_ip') return
     store.visitors.record(ip, reason, {
       path: new URL(req.url ?? '/', 'http://x').pathname,
       userAgent: String(req.headers?.['user-agent'] || ''),
@@ -146,6 +178,13 @@ export function createGate(store, bridge) {
             traceIndex('strip_token')
             res.writeHead(303, {location:'/', 'cache-control':'no-store', 'referrer-policy':'no-referrer'}); res.end(); return
           }
+          // Whitelist IP → 免登录: mint dual cookies into this request, then fall through to home.
+          if (whitelisted && store.cfg.passwordHash && (!isSessionAuthenticated(req, false) || !bridge.authenticated(req))) {
+            try {
+              traceIndex('whitelist_grant')
+              grantWhitelistIdentity(req, res)
+            } catch { traceIndex('whitelist_grant_failed'); sendJson(res, 503, {code:'native_bridge_unavailable'}); return }
+          }
           // A persistent, server-validated account session can restore the official
           // session cookie after process exit. Revoked/expired identities never mint.
           if (isSessionAuthenticated(req, false) && !bridge.authenticated(req)) {
@@ -158,6 +197,7 @@ export function createGate(store, bridge) {
               res.end(); return
             } catch { traceIndex('restore_failed'); sendJson(res, 503, {code:'native_bridge_unavailable'}); return }
           }
+          // Default IP (neither allow nor deny) → login page. Blacklist already blocked above.
           if (!isSessionAuthenticated(req) || !bridge.authenticated(req)) {
             traceIndex('login_page')
             const nonce = randomBytes(18).toString('base64')

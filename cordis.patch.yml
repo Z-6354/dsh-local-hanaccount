@@ -4,8 +4,8 @@
       name: dsh-local-hanaccount
       config:
         enabled: true
-        # Explicit audited build selection; operator attestation, not binary proof.
-        officialBuild: "0a15e36e7f82b6ed45af6fa9759f29b40dcd965d"
+        # Required connection methods and WebServer route structure are detected.
+        # Legacy officialBuild values remain readable metadata, not a version gate.
         canonicalOrigin: ""
         loginStylesheetUrl: ""
         outboundFetchEnabled: false

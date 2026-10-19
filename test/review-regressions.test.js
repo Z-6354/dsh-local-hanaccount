@@ -20,11 +20,11 @@ function server() {return {exact:new Map(),prefixes:new Map(),upgrades:new Map()
   registerFallback(handler) {this.fallback=handler;return () => {this.fallback=undefined}},
 }}
 async function fixture(run, passwordHash='configured') {
-  const dir=mkdtempSync(join(tmpdir(),'auth-review-')),web=server();let disposer,service
-  const ctx={get:key => key==='webServer'?web:connection, effect(setup) {disposer=setup()}, provide(_key,value) {service=value}}
+  const dir=mkdtempSync(join(tmpdir(),'auth-review-')),web=server();let disposer;const services=new Map()
+  const ctx={get:key => key==='webServer'?web:connection, effect(setup) {disposer=setup()}, provide(key,value) {services.set(key,value)}}
   const config={officialBuild:AUDITED_BUILD,dataDir:dir,ipLimitEnabled:false,passwordHash}
   await apply(ctx,config)
-  try {await run({dir,web,config,get store(){return service.store()},get service(){return service},dispose:() => disposer(), reapply:async() => apply(ctx,config)})}
+  try {await run({dir,web,config,get store(){return services.get('dshLocalHanaccount').store()},get service(){return services.get('dshLocalHanaccount')},dispose:() => disposer(), reapply:async() => apply(ctx,config)})}
   finally {disposer?.();rmSync(dir,{recursive:true,force:true})}
 }
 function response() {return {writeHead(status,headers) {this.status=status;this.headers=headers},end(body) {this.body=JSON.parse(body)}}}
@@ -50,7 +50,7 @@ for(const [method,path,body] of [['PUT','config',{password:'post-revoke-password
   }))
 }
 
-for(const path of ['config','auth/login','auth/setup']) test(`delayed ${path} cannot write retired store after same-directory reapply`, () => fixture(async f => {
+for(const path of ['config','auth/login']) test(`delayed ${path} cannot write retired store after same-directory reapply`, () => fixture(async f => {
   const old=f.store,token=old.issueSession(),cookie=`dsh_gate_token=${token}; ${native}`
   const deferred=delayedBody({password:'delayed-password',ipLimitEnabled:true})
   const pending=call(f,request(path,path==='config'?'PUT':'POST',deferred.stream,cookie));await deferred.entered
@@ -58,7 +58,7 @@ for(const path of ['config','auth/login','auth/setup']) test(`delayed ${path} ca
   deferred.release();await pending.done;assert.equal(pending.res.status,503);assert.deepEqual(snapshot(f),before)
   assert.ok(f.store.sessionFromToken(fresh));assert.equal(f.store.cfg.passwordHash,'new-generation')
   assert.throws(() => old.saveState(),{code:'auth_unavailable'});assert.throws(() => old.tokens.createApiToken('retired'),{code:'auth_unavailable'})
-},path==='auth/setup'?'':'configured'))
+},'configured'))
 
 test('remote pairing completion revalidates revoked session before local credential writes', () => fixture(async f => {
   const original=globalThis.fetch;let enter,release;const entered=new Promise(resolve => {enter=resolve}),waiting=new Promise(resolve => {release=resolve})

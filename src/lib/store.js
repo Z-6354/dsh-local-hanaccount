@@ -56,6 +56,8 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
     deny: [],
     ipLimitEnabled: true,
     trustProxy: true,
+    // Loopback gets 免登录 only when enabled: a tunnel terminating on this host looks exactly like the local browser.
+    loopbackOperator: false,
     nginxBasicAutoLogin: false,
     keyAuthEnabled: true,
     sessionMaxAgeDays: 7,
@@ -94,6 +96,7 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
       allow: cfg.allow,
       deny: cfg.deny,
       ipLimitEnabled: cfg.ipLimitEnabled,
+      loopbackOperator: cfg.loopbackOperator === true,
       nginxBasicAutoLogin: cfg.nginxBasicAutoLogin,
       keyAuthEnabled: cfg.keyAuthEnabled,
       sessionMaxAgeDays: cfg.sessionMaxAgeDays,
@@ -117,6 +120,7 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
       allow: [...cfg.allow],
       deny: [...cfg.deny],
       ipLimitEnabled: cfg.ipLimitEnabled,
+      loopbackOperator: cfg.loopbackOperator === true,
       nginxBasicAutoLogin: cfg.nginxBasicAutoLogin,
       keyAuthEnabled: cfg.keyAuthEnabled,
       sessionMaxAgeDays: cfg.sessionMaxAgeDays,
@@ -135,6 +139,7 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
       cfg.deny = nextDeny
     }
     if (patch.ipLimitEnabled != null) cfg.ipLimitEnabled = !!patch.ipLimitEnabled
+    if (patch.loopbackOperator != null) cfg.loopbackOperator = patch.loopbackOperator === true
     if (patch.nginxBasicAutoLogin != null) cfg.nginxBasicAutoLogin = !!patch.nginxBasicAutoLogin
     if (patch.keyAuthEnabled != null) cfg.keyAuthEnabled = !!patch.keyAuthEnabled
     if (patch.sessionMaxAgeDays != null) cfg.sessionMaxAgeDays = Number(patch.sessionMaxAgeDays) || 7
@@ -157,15 +162,17 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
 
   function issueSession() {
     const token = randomBytes(32).toString('hex')
-    state.sessions[token] = { createdAt: nowIso(), lastSeenAt: nowIso(), authVersion: authVersion() }
+    state.sessions[token] = { createdAt: nowIso(), lastSeenAt: nowIso(), authVersion: authVersion(), resumeScope: randomBytes(24).toString('hex') }
     saveState()
     return token
   }
 
   function sessionFromToken(token, { touch = true } = {}) {
     const t = String(token || '')
-    const s = state.sessions[t]
-    if (!s) return null
+    // state.sessions is a plain object: `__proto__` / `constructor` resolve to inherited, truthy values and would send
+    // an unauthenticated cookie down the "stale session" branch below (fsync + security broadcast).
+    const s = Object.hasOwn(state.sessions, t) ? state.sessions[t] : undefined
+    if (!s || typeof s !== 'object') return null
     const ttl = Math.max(1, Number(cfg.sessionMaxAgeDays) || 7) * 86400000
     const created = Date.parse(s.createdAt)
     const seen = Date.parse(s.lastSeenAt)
@@ -178,16 +185,53 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
     return s
   }
 
+  // UI preference partition only: never accepted by any authorization path.
+  function resumeScope(token) {
+    const session = sessionFromToken(token, { touch: false })
+    if (!session) return undefined
+    if (!/^[a-f0-9]{48}$/.test(session.resumeScope || '')) {
+      session.resumeScope = randomBytes(24).toString('hex')
+      saveState() // Fail closed; do not return an ephemeral scope or renew TTL.
+    }
+    return session.resumeScope
+  }
+
   function logout(token) {
-    if (token && state.sessions[token]) {
+    if (token && Object.hasOwn(state.sessions, token)) {
       delete state.sessions[token]
       try { saveState() } finally { securityChanged() }
     }
   }
 
+  // state.lockouts is persisted and keyed by client address, so it must stay bounded: without a cap, an attacker with
+  // many source addresses grows state.json (rewritten in full on every failure) without limit.
+  const MAX_LOCKOUTS = 2048
+  const LOCKOUT_IDLE_MS = 24 * 3600 * 1000
+  function pruneLockouts() {
+    const now = Date.now()
+    const table = state.lockouts
+    const keys = Object.keys(table)
+    if (keys.length < MAX_LOCKOUTS) return
+    for (const key of keys) {
+      const row = table[key]
+      const locked = row?.lockedUntil > now
+      const idle = !(now - (Number(row?.lastAttemptAt) || 0) < LOCKOUT_IDLE_MS)
+      if (!locked && idle) delete table[key]
+    }
+    const rest = Object.keys(table)
+    if (rest.length < MAX_LOCKOUTS) return
+    // Still full of live entries: drop the oldest unlocked first, then the oldest overall.
+    rest.sort((a, b) => ((table[a].lockedUntil > now) - (table[b].lockedUntil > now)) || ((table[a].lastAttemptAt || 0) - (table[b].lastAttemptAt || 0)))
+    for (const key of rest.slice(0, rest.length - MAX_LOCKOUTS + 1)) delete table[key]
+  }
+
   function getLockout(ip) {
-    if (!state.lockouts[ip]) state.lockouts[ip] = { attempts: 0, lockedUntil: 0 }
-    return state.lockouts[ip]
+    const key = String(ip)
+    if (!Object.hasOwn(state.lockouts, key)) {
+      pruneLockouts()
+      state.lockouts[key] = { attempts: 0, lockedUntil: 0, lastAttemptAt: 0 }
+    }
+    return state.lockouts[key]
   }
 
   return {
@@ -204,6 +248,7 @@ export function createStore(initialConfig = {}, {onStorageFailure} = {}) {
     setPasswordHash: guarded(setPasswordHash),
     issueSession: guarded(issueSession),
     sessionFromToken: guarded(sessionFromToken),
+    resumeScope: guarded(resumeScope),
     logout: guarded(logout),
     getLockout: guarded(getLockout),
     saveState: guarded(saveState),

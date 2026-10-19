@@ -1,16 +1,24 @@
 export const AUTH_PROTOCOL = 'password-native-v1'
-export const ADAPTER_ID = 'dsh-0a15e36-web-auth-v1'
+export const ADAPTER_ID = 'dsh-capability-web-auth-v1'
+// Historical source references retained for existing integrations, not activation gates.
 export const AUDITED_BUILD = '0a15e36e7f82b6ed45af6fa9759f29b40dcd965d'
+export const RC2_BUILD = 'npm:0.2.0-rc.2'
+export const ALPHA1_BUILD = 'npm:0.2.1-alpha.1'
+const CONNECTION_METHODS = ['requestRejection', 'authenticatedUrl', 'authorizeIndex']
+const WEB_SERVER_METHODS = ['register', 'registerUpgrade', 'registerFallback']
 
 function failure(code = 'native_bridge_unavailable', status = 503) {
   return Object.assign(new Error(code), { code, status })
 }
 
+function missingFailure(code, missingCapabilities) {
+  return Object.assign(failure(code), {message:`${code}: missing ${missingCapabilities.join(', ')}; use a DSH build exposing these interfaces`, missingCapabilities})
+}
+
 // Only the public connection owner can mint and verify its native cookie.
 export function createNativeBridge(connection) {
-  for (const method of ['requestRejection', 'authenticatedUrl', 'authorizeIndex']) {
-    if (typeof connection?.[method] !== 'function') throw failure()
-  }
+  const missing = CONNECTION_METHODS.filter(method => typeof connection?.[method] !== 'function')
+  if (missing.length) throw missingFailure('native_bridge_unavailable', missing.map(method => `connection.${method}`))
   let disposed = false
   function fence(req) {
     if (disposed) throw failure()
@@ -147,16 +155,23 @@ const guards = new WeakMap()
 export function createDshAdapter(webServer, connection, config = {}) {
   webServer = webServer?.[Symbol.for('cordis.original')] || webServer
   const previous = guards.get(webServer)
-  if (config.officialBuild !== AUDITED_BUILD) {
-    previous?.stop('official_build_unsupported')
-    throw failure('official_build_unsupported')
+  const capabilities = {
+    connection: Object.fromEntries(CONNECTION_METHODS.map(method => [method, typeof connection?.[method] === 'function'])),
+    webServer: Object.fromEntries(WEB_SERVER_METHODS.map(method => [method, typeof webServer?.[method] === 'function'])),
+  }
+  const missing = WEB_SERVER_METHODS.filter(method => !capabilities.webServer[method])
+  if (missing.length) {
+    previous?.stop('webserver_unsupported')
+    throw missingFailure('webserver_unsupported', missing.map(method => `webServer.${method}`))
+  }
+  if (Object.values(capabilities.connection).some(value => !value)) {
+    previous?.stop('native_bridge_unavailable')
+    // Install the deny-only guard first on a compatible new dispatcher.
+    if (previous) createNativeBridge(connection)
   }
   if (config.enabled === false) previous?.stop('auth_disabled')
   if (previous?.ready) throw failure('auth_already_active')
   previous?.stop('auth_reapplying')
-  for (const method of ['register', 'registerUpgrade', 'registerFallback']) {
-    if (typeof webServer?.[method] !== 'function') throw failure('webserver_unsupported')
-  }
   let guard = previous
   if (!guard) {
     let gate, owner, ready = false, code = 'auth_starting'
@@ -192,7 +207,8 @@ export function createDshAdapter(webServer, connection, config = {}) {
         }
       },
     }
-    installation = installRouteGate(webServer, wrappers, {permanent:true})
+    try { installation = installRouteGate(webServer, wrappers, {permanent:true}) }
+    catch (error) { throw Object.assign(error, {code:'webserver_unsupported', status:503}) }
     guard = {stop, get ready() { return !!available() },
       claim(epoch) { owner = epoch; code = epoch.code },
       owns(epoch) { return owner === epoch },
@@ -201,10 +217,12 @@ export function createDshAdapter(webServer, connection, config = {}) {
         gate = value; ready = true; code = epoch.code = 'auth_ready'
       },
       isCurrent(epoch) { return owner === epoch && !!available() },
-      state() { return {adapterId:ADAPTER_ID, officialBuild:AUDITED_BUILD, buildIdentity:'operator-attestation', ready:!!available(), code, deploymentReady:false} },
+      state() { return {ready:!!available(), code, deploymentReady:false} },
     }
     guards.set(webServer, guard)
   }
+  capabilities.webServer.routeTables = ['prefixes', 'exact', 'upgrades'].every(slot => webServer[slot] instanceof Map)
+  capabilities.webServer.fallbackShape = true // installRouteGate preflight passed.
   const epoch = {code:'auth_starting'}
   guard.claim(epoch)
   let bridge
@@ -215,7 +233,8 @@ export function createDshAdapter(webServer, connection, config = {}) {
     bridge,
     isCurrent: () => !stopped && guard.isCurrent(epoch),
     state() {
-      const state = guard.state()
+      const state = { ...guard.state(), adapterId:ADAPTER_ID, compatibilityMode:'capability-based',
+        officialBuild:config.officialBuild ?? null, buildIdentity:'unverified-configuration', capabilities }
       return guard.owns(epoch) ? state : {...state, ready:false, code:epoch.code}
     },
     activate(gate) { if (stopped) throw failure(); guard.activate(gate, epoch) },

@@ -55,17 +55,15 @@ function runHttpGate(store, req) {
   return { res, hit }
 }
 
-test('attack: non-whitelisted IP gets 403 (ip_blocked)', () => {
+test('attack: non-whitelisted default IP passes IP gate (login page path, not 403)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lha-atk-'))
   try {
     const store = createStore({ dataDir: dir, allow: ['127.0.0.1'], ipLimitEnabled: true })
     const req = mockReq({ remote: '203.0.113.50' })
-    const { res, blocked } = runIpGate(store, req)
-    assert.equal(blocked, true)
-    assert.equal(res.statusCode, 403)
-    assert.match(res.body, /access_denied/)
-    const visitors = store.visitors.listVisitors()
-    assert.ok(visitors.some((v) => v.ip === '203.0.113.50' && v.lastReason === 'ip_blocked'))
+    const { blocked } = runIpGate(store, req)
+    assert.notEqual(blocked, true)
+    assert.equal(blocked.whitelisted, false)
+    assert.equal(blocked.ip, '203.0.113.50')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -125,9 +123,11 @@ test('attack: X-Real-IP honored only from trusted proxy (127.0.0.1)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lha-atk-'))
   try {
     const store = createStore({ dataDir: dir, allow: ['127.0.0.1'], ipLimitEnabled: true })
-    const { res, blocked } = runIpGate(store, req)
-    assert.equal(blocked, true)
-    assert.equal(res.statusCode, 403)
+    const { blocked } = runIpGate(store, req)
+    // Spoofed client is a default IP → not blacklisted → IP gate passes (login, not 403).
+    assert.notEqual(blocked, true)
+    assert.equal(blocked.whitelisted, false)
+    assert.equal(blocked.ip, '203.0.113.55')
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -185,7 +185,8 @@ test('attack: wrapWebServer protects dynamically registered routes', () => {
     const req = mockReq({ url: '/api/secret', remote: '203.0.113.61' })
     const res = mockRes()
     webServer.prefixes.get('/api').handler(req, res)
-    assert.equal(res.statusCode, 403)
+    // Default IP is no longer blocked at the IP gate; unauthenticated access is 401.
+    assert.equal(res.statusCode, 401)
     unpatch()
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -226,14 +227,14 @@ test('live: localhost unauthenticated gets 401 not 403', async (t) => {
   assert.equal(body.error, 'login required')
 })
 
-test('attack: IP limit blocks login endpoint for external IP', () => {
+test('attack: default IP can reach login API path (IP gate does not 403)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lha-atk-'))
   try {
     const store = createStore({ dataDir: dir, allow: ['127.0.0.1'], ipLimitEnabled: true })
     const req = mockReq({ url: '/dsh-local-hanaccount/api/auth/login', remote: '203.0.113.88' })
-    const { res, blocked } = runIpGate(store, req)
-    assert.equal(blocked, true)
-    assert.equal(res.statusCode, 403)
+    const { blocked } = runIpGate(store, req)
+    assert.notEqual(blocked, true)
+    assert.equal(blocked.whitelisted, false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

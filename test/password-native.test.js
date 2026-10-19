@@ -10,10 +10,11 @@ import { hashPassword } from '../src/lib/password.js'
 import { createGate, wrapWebServer } from '../src/gate.js'
 import { createApiHandler } from '../src/api.js'
 import { verifyAuthentication } from '../src/lib/passkey.js'
+import { createRpcAuthorization } from '../src/lib/rpc-authorization.js'
 
 function owner(overrides = {}) {
   return {
-    requestRejection(req) { if (req.headers.host !== 'localhost') return 403; return req.headers.cookie === 'dsh-auth-fixture=native' ? undefined : 401 },
+    requestRejection(req) { if (req.headers.host !== 'localhost') return 403; return String(req.headers.cookie || '').split(/;\s*/).includes('dsh-auth-fixture=native') ? undefined : 401 },
     authenticatedUrl() { return 'http://localhost/?token=internal-only' },
     authorizeIndex(req,res) { assert.equal(req.url,'/?token=internal-only');res.writeHead(303,{location:'/', 'set-cookie':'dsh-auth-fixture=native; Path=/; HttpOnly; SameSite=Strict'});res.end();return false },
     ...overrides,
@@ -23,9 +24,9 @@ function fixture(fn) {
   const dir=mkdtempSync(join(tmpdir(),'native-test-'));const store=createStore({dataDir:dir,ipLimitEnabled:false});store.setPasswordHash(hashPassword('fixture-password'));const bridge=createNativeBridge(owner());const gate=createGate(store,bridge)
   return Promise.resolve().then(()=>fn({store,bridge,gate})).finally(()=>{gate.dispose();bridge.dispose();rmSync(dir,{recursive:true,force:true})})
 }
-async function login({store,bridge,gate}, password='fixture-password', host='localhost') {
+async function login({store,bridge,gate,rpcAuthorization}, password='fixture-password', host='localhost') {
   const req=Readable.from([JSON.stringify({password})]);Object.assign(req,{method:'POST',url:'/dsh-local-hanaccount/api/auth/login',headers:{host,'content-type':'application/json'},socket:{remoteAddress:'127.0.0.1'}})
-  const response={};await createApiHandler({store,gate,bridge})(req,{writeHead(status,headers){Object.assign(response,{status,headers})},end(body){response.body=JSON.parse(body)}});return response
+  const response={};await createApiHandler({store,gate,bridge,rpcAuthorization})(req,{writeHead(status,headers){Object.assign(response,{status,headers})},end(body){response.body=JSON.parse(body)}});return response
 }
 test('public native mint fences original Host and verifies minted cookie without changing request',()=>{
  const bridge=createNativeBridge(owner());const req={method:'POST',url:'/auth/login',headers:{host:'localhost'}};assert.match(bridge.mint(req,true),/; Secure$/);assert.equal(req.url,'/auth/login');assert.throws(()=>bridge.mint({...req,headers:{host:'evil'}}),{code:'access_denied'});bridge.dispose();assert.throws(()=>bridge.mint(req),{code:'native_bridge_unavailable'})
@@ -42,6 +43,17 @@ test('bridge rejects unavailable methods, unexpected response and failed officia
 })
 test('password login publishes two independent cookies and stable rejection codes',()=>fixture(async f=>{
  const ok=await login(f);assert.equal(ok.status,200);assert.equal(ok.headers['set-cookie'].length,2);assert.deepEqual(ok.body,{ok:true,protocol:'password-native-v1'});assert.equal((await login(f,'wrong')).body.code,'invalid_password');assert.equal((await login(f,'fixture-password','evil')).status,403)
+}))
+
+test('missing optional RPC admission does not disable basic password login',()=>fixture(async f=>{
+ const rpcAuthorization=createRpcAuthorization({store:f.store,connection:owner(),bridge:f.bridge,gate:f.gate})
+ try {
+  assert.equal(rpcAuthorization.state().available,false)
+  const ok=await login({...f,rpcAuthorization})
+  assert.equal(ok.status,200);assert.equal(ok.headers['set-cookie'].length,2)
+  const req={headers:{host:'localhost',cookie:ok.headers['set-cookie'].map(cookie=>cookie.split(';')[0]).join('; ')},socket:{remoteAddress:'127.0.0.1'}}
+  assert.throws(()=>rpcAuthorization.issueForRequest(req),{code:'rpc_authorization_unavailable',status:503})
+ } finally {rpcAuthorization.dispose()}
 }))
 test('failed storage commit never publishes either cookie and removes pending in-memory session',()=>fixture(async f=>{
  f.store.issueSession=()=>{f.store.state.sessions.pending={};throw Error('secret filesystem path')};const result=await login(f);assert.equal(result.status,503);assert.equal(result.body.code,'storage_unavailable');assert.equal(result.headers['set-cookie'],undefined);assert.deepEqual(f.store.state.sessions,{})
@@ -96,4 +108,68 @@ test('persistent valid session restores official browser identity without passwo
  store.logout(token)
  gate.wrapHttpHandler(()=>{throw Error('revoked identity must not reach SPA')})({method:'GET',url:'/',headers:{host:'localhost',cookie:`dsh_gate_token=${token}`},socket:{remoteAddress:'127.0.0.1'}},{writeHead(s,h){status=s;headers=h},end(b){body=b}})
  assert.equal(status,200);assert.equal(headers['set-cookie'],undefined);assert.match(body,/登录/)
+}))
+
+test('/auth/me exposes UI scope only with both independent identities', () => fixture(async f => {
+  const token = f.store.issueSession()
+  async function me(cookie) {
+    const response = {}
+    await createApiHandler(f)({ method: 'GET', url: '/dsh-local-hanaccount/api/auth/me', headers: { host: 'localhost', cookie }, socket: { remoteAddress: '127.0.0.1' } }, { writeHead(status) { response.status = status }, end(body) { response.body = JSON.parse(body) } })
+    return response
+  }
+  for (const cookie of ['', `dsh_gate_token=${token}`, 'dsh-auth-fixture=native']) {
+    const result = await me(cookie)
+    assert.equal(result.status, 200)
+    assert.equal(result.body.resumeScope, undefined)
+  }
+  const result = await me(`dsh_gate_token=${token}; dsh-auth-fixture=native`)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.resumeScope, f.store.resumeScope(token))
+  assert.notEqual(result.body.resumeScope, token)
+}))
+
+test('POST /auth/rpc-grant requires both identities and returns a no-store, host-authorized lease', () => fixture(async f => {
+  const token = f.store.issueSession()
+  const operator = { id: 'operator' }
+  const connection = owner({ operator, admit(req) {
+    const rejection = this.requestRejection(req)
+    return rejection === undefined ? { peer: operator } : { rejection }
+  } })
+  const rpcAuthorization = createRpcAuthorization({ store: f.store, connection, bridge: f.bridge, gate: f.gate, isCurrent: () => true })
+  const api = createApiHandler({ ...f, rpcAuthorization })
+  async function issue(cookie, body = '{}') {
+    const req = Readable.from([body])
+    Object.assign(req, { method: 'POST', url: '/dsh-local-hanaccount/api/auth/rpc-grant', headers: { host: 'localhost', cookie, 'content-type': 'application/json' }, socket: { remoteAddress: '127.0.0.1' } })
+    const response = {}
+    await api(req, { writeHead(status, headers) { Object.assign(response, { status, headers }) }, end(value) { response.body = value ? JSON.parse(value) : null } })
+    return response
+  }
+  const gateOnly = await issue(`dsh_gate_token=${token}`)
+  assert.equal(gateOnly.status, 401)
+  assert.equal(rpcAuthorization.size, 0)
+  const nativeOnly = await issue('dsh-auth-fixture=native')
+  assert.equal(nativeOnly.status, 401)
+  assert.equal(rpcAuthorization.size, 0)
+  const both = await issue(`dsh_gate_token=${token}; dsh-auth-fixture=native`)
+  assert.equal(both.status, 200)
+  assert.equal(both.headers['cache-control'], 'no-store')
+  assert.equal(both.body.protocol, 1)
+  assert.equal(both.body.scope, f.store.resumeScope(token))
+  const authorized = rpcAuthorization.authorizeGrant({ peer: operator, grant: both.body.grant, expectedScope: both.body.scope })
+  assert.equal(authorized.scope, both.body.scope)
+  f.store.logout(token)
+  assert.equal(authorized.signal.aborted, true)
+  rpcAuthorization.dispose()
+}))
+
+test('/auth/me legacy scope persistence failure closes auth and exposes no scope', () => fixture(async f => {
+  const { mkdirSync, unlinkSync } = await import('node:fs')
+  const token = f.store.issueSession()
+  delete f.store.state.sessions[token].resumeScope
+  const stateFile = join(f.store.dataDir, 'state.json')
+  unlinkSync(stateFile); mkdirSync(stateFile)
+  let status, body
+  await createApiHandler(f)({ method: 'GET', url: '/dsh-local-hanaccount/api/auth/me', headers: { host: 'localhost', cookie: `dsh_gate_token=${token}; dsh-auth-fixture=native` }, socket: { remoteAddress: '127.0.0.1' } }, { writeHead(value) { status = value }, end(value) { body = JSON.parse(value) } })
+  assert.equal(status, 503); assert.equal(body.resumeScope, undefined)
+  assert.throws(() => f.store.sessionFromToken(token), { code: 'auth_unavailable' })
 }))

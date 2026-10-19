@@ -24,11 +24,19 @@ const cfg = {officialBuild:AUDITED_BUILD}
 const request = (url='/api/business', method='GET') => ({url, method, headers:{host:'localhost'}, socket:{remoteAddress:'127.0.0.1'}})
 function response() { return {writeHead(status, headers) { this.status=status; this.headers=headers }, end(body) { this.body=body }} }
 
-test('missing and unknown audited build refuse selection', () => {
-  for (const config of [{}, {officialBuild:'future-build'}]) assert.throws(() => createDshAdapter(server(), connection, config), {code:'official_build_unsupported'})
+test('missing and unknown build metadata activate by supported capabilities', () => {
+  for (const config of [{}, {officialBuild:'future-build'}]) {
+    const adapter = createDshAdapter(server(), connection, config)
+    adapter.activate({wrapHttpHandler:f => f, wrapUpgradeHandler:f => f, dispose(){}})
+    assert.equal(adapter.state().ready, true)
+    assert.equal(adapter.state().compatibilityMode, 'capability-based')
+    assert.equal(adapter.state().officialBuild, config.officialBuild ?? null)
+    assert.equal(adapter.state().capabilities.connection.authorizeIndex, true)
+    adapter.stop()
+  }
 })
 
-test('dispose and reapply retain closed route wrappers, accept late fallback/routes and release no store reads', () => {
+test('dispose and reapply retain closed route wrappers; missing connection capabilities retire the active guard', () => {
   const web=server(); let executed=0
   web.register({kind:'exact',path:'/business',handler:() => executed++})
   const first=createDshAdapter(web, connection, cfg)
@@ -39,10 +47,10 @@ test('dispose and reapply retain closed route wrappers, accept late fallback/rou
   first.stop(); first.stop(); const blocked=response();web.exact.get('/business').handler(request(),blocked);assert.equal(blocked.status,503)
   web.register({kind:'prefix',path:'/late',handler:() => executed++});web.registerFallback(() => executed++)
   const fallback=response();web.fallback(request('/spa/deep'),fallback);assert.equal(fallback.status,503)
-  assert.throws(() => createDshAdapter(web,connection,{officialBuild:'unknown'}), {code:'official_build_unsupported'})
+  assert.throws(() => createDshAdapter(web,{},{}), {code:'native_bridge_unavailable'})
   const next=createDshAdapter(web,connection,cfg);next.activate(policy)
   web.prefixes.get('/late').handler(request('/late'),response());assert.equal(executed,2)
-  assert.throws(() => createDshAdapter(web,connection,{officialBuild:'unknown'}), {code:'official_build_unsupported'})
+  assert.throws(() => createDshAdapter(web,{},{}), {code:'native_bridge_unavailable'})
   assert.equal(next.state().ready,false);const unknown=response();web.fallback(request('/deep'),unknown);assert.equal(unknown.status,503);next.stop()
 })
 
@@ -57,8 +65,8 @@ test('retired adapter stop, state and late activate cannot take ownership from a
   web.registerFallback(() => executed++)
   const old=createDshAdapter(web,connection,cfg)
   old.activate({wrapHttpHandler:f => f,wrapUpgradeHandler:f => f,dispose(){oldDisposed++}})
-  assert.throws(() => createDshAdapter(web,connection,{officialBuild:'unknown'}),{code:'official_build_unsupported'})
-  assert.equal(oldDisposed,1);assert.equal(old.state().code,'official_build_unsupported')
+  assert.throws(() => createDshAdapter(web,{},{}),{code:'native_bridge_unavailable'})
+  assert.equal(oldDisposed,1);assert.equal(old.state().code,'native_bridge_unavailable')
   const current=createDshAdapter(web,connection,cfg)
   current.activate({wrapHttpHandler:f => f,wrapUpgradeHandler:f => f,dispose(){newDisposed++}})
   assert.equal(current.state().ready,true);assert.equal(old.state().ready,false)
@@ -82,15 +90,26 @@ test('invalid late route changes readiness to unavailable, Map mutation failure 
 })
 
 test('apply registers readiness and keeps deny layer after disposal, disables auth without restoring routes', async () => {
-  const dir=mkdtempSync(join(tmpdir(),'auth-apply-')),web=server();let dispose, provided
-  const ctx={get:name => name === 'webServer' ? web : connection, effect(setup) {dispose=setup()},provide(_name,value) {provided=value}}
+  const dir=mkdtempSync(join(tmpdir(),'auth-apply-')),web=server();let dispose;const provided=new Map()
+  const ctx={get:name => name === 'webServer' ? web : connection, effect(setup) {dispose=setup()},provide(name,value) {provided.set(name,value)}}
   try {
-    await apply(ctx,{...cfg,dataDir:dir});assert.equal(provided.securityState().ready,true)
+    await apply(ctx,{...cfg,dataDir:dir});assert.equal(provided.get('dshLocalHanaccount').securityState().ready,true);assert.equal(typeof provided.get('hanaccountRpcAuthorization').authorizeGrant,'function')
+    assert.equal(provided.get('dshLocalHanaccount').securityState().rpcAuthorization.available,false)
     dispose();const res=response();web.registerFallback(() => {throw Error('must not execute')});web.fallback(request('/'),res);assert.equal(res.status,503)
-    await apply(ctx,{...cfg,dataDir:dir});assert.equal(provided.securityState().ready,true);dispose()
+    await apply(ctx,{...cfg,dataDir:dir});assert.equal(provided.get('dshLocalHanaccount').securityState().ready,true);dispose()
     await assert.rejects(apply(ctx,{...cfg,enabled:false,dataDir:dir}), {code:'auth_disabled'})
     const unavailable=response();web.fallback(request('/'),unavailable);assert.equal(unavailable.status,503)
   } finally {dispose?.();rmSync(dir,{recursive:true,force:true})}
+})
+
+test('missing required public methods report the exact dependency instead of rejecting a version', () => {
+  const web=server();web.registerUpgrade=undefined
+  assert.throws(() => createDshAdapter(web,connection), error => error.code === 'webserver_unsupported'
+    && error.missingCapabilities.includes('webServer.registerUpgrade'))
+  for (const method of ['requestRejection','authenticatedUrl','authorizeIndex']) {
+    assert.throws(() => createDshAdapter(server(),{...connection,[method]:undefined}), error => error.code === 'native_bridge_unavailable'
+      && error.missingCapabilities.includes(`connection.${method}`))
+  }
 })
 
 test('all dynamic assets/plugin reads require auth; only canonical exact login stylesheet read is exempt', () => {

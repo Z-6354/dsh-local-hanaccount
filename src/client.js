@@ -11,6 +11,52 @@ window.__ModuleLoader__.load({
     const API = '/dsh-local-hanaccount/api'
     const STYLE_ID = 'dsh-local-hanaccount-css-v12'
 
+    /** Same-origin JSON request shared by the early bootstrap and client bundle. */
+    function createAuthRequest({ fetchImpl = globalThis.fetch, base = '/dsh-local-hanaccount/api', origin = globalThis.location?.origin } = {}) {
+      if (typeof fetchImpl !== 'function') throw new TypeError('fetch unavailable')
+      const baseUrl = new URL(base, origin)
+      if (!origin || baseUrl.origin !== origin || baseUrl.pathname.endsWith('/')) throw new TypeError('same-origin API required')
+      const prefix = baseUrl.pathname.replace(/\/$/, '')
+      return async function request(path, options = {}) {
+        const endpoint = new URL(`${prefix}${path}`, origin)
+        if (endpoint.origin !== origin || !endpoint.pathname.startsWith(`${prefix}/`)) throw new TypeError('same-origin API path required')
+        const controller = typeof AbortController === 'function' ? new AbortController() : null
+        const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs) : 5000
+        const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null
+        const onAbort = () => controller?.abort()
+        const externalSignal = options.signal
+        if (externalSignal?.aborted) controller?.abort()
+        else externalSignal?.addEventListener?.('abort', onAbort, { once: true })
+        try {
+          const { signal: _signal, timeoutMs: _timeout, ...requestOptions } = options
+          const response = await fetchImpl(endpoint.href, {
+            credentials: 'same-origin',
+            cache: 'no-store',
+            redirect: 'error',
+            headers: { 'content-type': 'application/json', ...(requestOptions.headers || {}) },
+            ...requestOptions,
+            signal: controller?.signal ?? externalSignal,
+          })
+          if (response.redirected) throw Object.assign(new Error('cross_origin_redirect'), { status: response.status })
+          let body = {}
+          const text = await response.text()
+          try { body = text ? JSON.parse(text) : {} } catch {
+            throw Object.assign(new Error('invalid_json'), { status: response.status })
+          }
+          if (!response.ok) throw Object.assign(new Error(body.error || `HTTP ${response.status}`), { status: response.status, code: body.code })
+          return body
+        } catch (error) {
+          if (error?.name === 'AbortError') throw Object.assign(new Error('timeout'), { name: 'TimeoutError' })
+          throw error
+        } finally {
+          if (timer) clearTimeout(timer)
+          externalSignal?.removeEventListener?.('abort', onAbort)
+        }
+      }
+    }
+
+    /** Client auth recovery: classify /auth/me without treating transport errors as logout. */
+
     const AUTH_STATUS = {
       unknown: 'unknown',
       checking: 'checking',
@@ -18,49 +64,101 @@ window.__ModuleLoader__.load({
       unauthenticated: 'unauthenticated',
       unavailable: 'unavailable',
     }
-    const listeners = new Set()
-    const session = createAuthSession()
-    const state = { me: null, loading: true, auth: session.snapshot() }
-    function emit() { for (const fn of listeners) fn({ ...state }) }
-    function setState(patch) { Object.assign(state, patch); emit() }
-    function publishSession() {
-      const auth = session.snapshot()
-      setState({ me: auth.me, loading: auth.loading, auth })
-    }
 
     function classifyMeResponse(me) {
-      if (me?.nginxMisconfig?.misconfigured) return { status: AUTH_STATUS.unavailable, reason: 'nginx', substatus: null, me }
-      if (me && me.authenticated === true && me.nativeAuthenticated === true) return { status: AUTH_STATUS.authenticated, reason: 'ok', substatus: null, me }
-      if (me && me.authenticated === true && me.nativeAuthenticated !== true) return { status: AUTH_STATUS.unavailable, reason: 'nativeMissing', substatus: 'nativeMissing', me }
+      if (me?.nginxMisconfig?.misconfigured) {
+        return { status: AUTH_STATUS.unavailable, reason: 'nginx', substatus: null, me }
+      }
+      if (me && me.authenticated === true && me.nativeAuthenticated === true) {
+        return { status: AUTH_STATUS.authenticated, reason: 'ok', substatus: null, me }
+      }
+      if (me && me.authenticated === true && me.nativeAuthenticated !== true) {
+        return { status: AUTH_STATUS.unavailable, reason: 'nativeMissing', substatus: 'nativeMissing', me }
+      }
       if (me && (me.authenticated === false || me.passwordConfigured === false)) {
         return { status: AUTH_STATUS.unauthenticated, reason: me.passwordConfigured === false ? 'setup_required' : 'unauthenticated', substatus: null, me }
       }
       return { status: AUTH_STATUS.unavailable, reason: 'malformed', substatus: null, me }
     }
+
     function classifyMeFailure(error) {
-      const statusCode = Number(error?.status) || 0
+      const status = Number(error?.status) || 0
       const name = error?.name || ''
-      if (name === 'AbortError' || name === 'TimeoutError') return { status: AUTH_STATUS.unavailable, reason: 'timeout', substatus: null, me: null }
-      if (statusCode === 401 || statusCode === 403) return { status: AUTH_STATUS.unauthenticated, reason: `http_${statusCode}`, substatus: null, me: null }
-      if (statusCode === 502 || statusCode === 503 || statusCode === 504) return { status: AUTH_STATUS.unavailable, reason: `http_${statusCode}`, substatus: null, me: null }
+      if (name === 'AbortError' || name === 'TimeoutError') {
+        return { status: AUTH_STATUS.unavailable, reason: 'timeout', substatus: null, me: null }
+      }
+      if (status === 403 && error?.code === 'access_denied') {
+        return { status: AUTH_STATUS.unavailable, reason: 'access_denied', substatus: 'access_denied', me: null }
+      }
+      if (status === 401 || status === 403) {
+        return { status: AUTH_STATUS.unauthenticated, reason: `http_${status}`, substatus: null, me: null }
+      }
+      if (status === 502 || status === 503 || status === 504) {
+        return { status: AUTH_STATUS.unavailable, reason: `http_${status}`, substatus: null, me: null }
+      }
       return { status: AUTH_STATUS.unavailable, reason: 'network', substatus: null, me: null }
     }
+
     function loginGateDecision(snapshot) {
-      if (!snapshot || snapshot.status === AUTH_STATUS.unknown || snapshot.status === AUTH_STATUS.checking) return { overlay: 'loading', redirect: false }
-      if (snapshot.me?.nginxMisconfig?.misconfigured) return { overlay: 'nginx', redirect: false }
-      if (snapshot.status === AUTH_STATUS.unavailable) return { overlay: 'unavailable', redirect: false }
+      if (!snapshot || snapshot.status === AUTH_STATUS.unknown || snapshot.status === AUTH_STATUS.checking) {
+        return { overlay: 'loading', redirect: false }
+      }
+      if (snapshot.me?.nginxMisconfig?.misconfigured) {
+        return { overlay: 'nginx', redirect: false }
+      }
+      if (snapshot.status === AUTH_STATUS.unavailable) {
+        return { overlay: 'unavailable', redirect: false }
+      }
       if (snapshot.status === AUTH_STATUS.unauthenticated) {
         return { overlay: snapshot.redirectsRemaining > 0 ? null : 'unauthenticated', redirect: snapshot.redirectsRemaining > 0 }
       }
       return { overlay: null, redirect: false }
     }
-    function createAuthSession() {
-      let status = AUTH_STATUS.unknown, reason = null, substatus = null, me = null, lastConfirmed = null, version = 0, inflight = null, redirectsUsed = 0, controller = null
-      function snapshot() {
-        return { status, reason, substatus, me, lastConfirmed, loading: status === AUTH_STATUS.unknown || status === AUTH_STATUS.checking, redirectsRemaining: Math.max(0, 1 - redirectsUsed) }
+
+    function createAuthSession({ request, timeoutMs = 5000 } = {}) {
+      const listeners = new Set()
+      let disposed = false
+      let revision = 0
+      let scope = null
+      const emit = () => { revision += 1; for (const listener of listeners) listener(getSnapshot()) }
+      function getSnapshot() { return { status, reason, scope, revision } }
+      let status = AUTH_STATUS.unknown
+      let reason = null
+      let substatus = null
+      let me = null
+      let lastConfirmed = null
+      let version = 0
+      let inflight = null
+      let redirectsUsed = 0
+      let controller = null
+      let rpcGrant = null
+      let rpcGrantFlight = null
+      let rpcGrantController = null
+      let rpcGrantGeneration = 0
+
+      function retireRpcGrant() {
+        rpcGrantGeneration += 1
+        rpcGrant = null
+        rpcGrantController?.abort()
+        rpcGrantController = null
+        rpcGrantFlight = null
       }
+
+      function snapshot() {
+        return {
+          status,
+          reason,
+          substatus,
+          me,
+          lastConfirmed,
+          loading: status === AUTH_STATUS.unknown || status === AUTH_STATUS.checking,
+          redirectsRemaining: Math.max(0, 1 - redirectsUsed),
+        }
+      }
+
       function apply(classified) {
         if (classified.status === AUTH_STATUS.unavailable) {
+          if (classified.substatus === 'access_denied') retireRpcGrant()
           status = AUTH_STATUS.unavailable
           reason = classified.reason
           substatus = classified.substatus
@@ -71,75 +169,149 @@ window.__ModuleLoader__.load({
         reason = classified.reason
         substatus = classified.substatus
         me = classified.me
+        const nextScope = status === AUTH_STATUS.authenticated && /^[a-f0-9]{48}$/.test(me?.resumeScope || '') ? me.resumeScope : null
+        if (scope !== nextScope) retireRpcGrant()
+        scope = nextScope
         lastConfirmed = classified
       }
+
       async function refresh() {
+        if (disposed) return snapshot()
         if (inflight) return inflight
         const mine = ++version
         if (status !== AUTH_STATUS.authenticated) status = AUTH_STATUS.checking
-        publishSession()
-        controller = typeof AbortController === 'function' ? new AbortController() : null
-        const timer = controller ? setTimeout(() => controller.abort(), 5000) : null
-        inflight = (async () => {
+        const requestController = typeof AbortController === 'function' ? new AbortController() : null
+        controller = requestController
+        const timer = timeoutMs > 0 && requestController ? setTimeout(() => requestController.abort(), timeoutMs) : null
+        let resolveFlight
+        const flight = new Promise(resolve => { resolveFlight = resolve })
+        inflight = flight // Publish ownership before any subscriber can reenter refresh.
+        emit()
+        ;(async () => {
           try {
-            const body = await api('/auth/me', { signal: controller?.signal })
-            if (mine !== version) return snapshot()
-            apply(classifyMeResponse(body))
+            const body = await request('/auth/me', { signal: requestController?.signal })
+            if (mine === version) apply(classifyMeResponse(body))
           } catch (error) {
-            if (mine !== version) return snapshot()
-            apply(classifyMeFailure(error))
+            if (mine === version) apply(classifyMeFailure(error))
           } finally {
             if (timer) clearTimeout(timer)
-            if (mine === version) inflight = null
+            if (mine === version) { inflight = null; emit() }
+            resolveFlight(snapshot())
           }
-          publishSession()
-          return snapshot()
         })()
-        return inflight
+        return flight
       }
+
       function noteRedirect() {
         if (status !== AUTH_STATUS.unauthenticated || redirectsUsed >= 1) return false
         redirectsUsed += 1
         return true
       }
-      function dispose() {
+
+      // A successful local logout is an authoritative revocation even though the
+      // follow-up navigation may happen before another /auth/me request completes.
+      // Retire any older response so it cannot restore the just-revoked scope.
+      function invalidate(why = 'invalidated') {
+        if (disposed) return snapshot()
         version += 1
+        controller?.abort()
+        controller = null
+        retireRpcGrant()
+        inflight = null
+        status = AUTH_STATUS.unauthenticated
+        scope = null
+        substatus = null
+        me = { authenticated: false, nativeAuthenticated: false }
+        lastConfirmed = null
+        redirectsUsed = 0
+        reason = String(why || 'invalidated').slice(0, 80)
+        emit()
+        return snapshot()
+      }
+
+      function dispose() {
+        disposed = true
+        version += 1
+        listeners.clear()
         inflight = null
         controller?.abort()
+        retireRpcGrant()
       }
-      return { refresh, snapshot, noteRedirect, dispose }
+
+      async function requestRpcGrant({ signal, force = false } = {}) {
+        const abortError = () => Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'aborted' })
+        if (signal?.aborted) throw abortError()
+        if (disposed || status !== AUTH_STATUS.authenticated || !scope) throw Object.assign(new Error('auth_required'), { code: 'auth_required' })
+        const expectedScope = scope
+        if (!force && rpcGrant?.scope === expectedScope && rpcGrant.expiresAt > Date.now() + 2_000) return { ...rpcGrant }
+        let flight = !force ? rpcGrantFlight : null
+        if (!flight) {
+          rpcGrantController?.abort()
+          const requestController = typeof AbortController === 'function' ? new AbortController() : null
+          const generation = ++rpcGrantGeneration
+          rpcGrantController = requestController
+          flight = { waiters: new Set(), controller: requestController, generation, promise: null }
+          flight.promise = (async () => {
+          try {
+            const value = await request('/auth/rpc-grant', { method: 'POST', body: '{}', ...(requestController ? { signal: requestController.signal } : {}) })
+            if (disposed || generation !== rpcGrantGeneration || status !== AUTH_STATUS.authenticated || scope !== expectedScope || flight.waiters.size === 0) {
+              throw Object.assign(new Error('auth_scope_changed'), { code: 'auth_scope_changed' })
+            }
+            if (value?.protocol !== 1 || typeof value.grant !== 'string' || !/^[a-f0-9]{64}$/.test(value.grant)
+              || value.scope !== expectedScope || !Number.isSafeInteger(value.expiresAt)
+              || value.expiresAt <= Date.now() || value.expiresAt > Date.now() + 300_000) {
+              throw Object.assign(new Error('invalid_rpc_grant'), { code: 'invalid_rpc_grant' })
+            }
+            rpcGrant = { protocol: 1, grant: value.grant, scope: value.scope, expiresAt: value.expiresAt }
+            return { ...rpcGrant }
+          } finally {
+            if (generation === rpcGrantGeneration) {
+              rpcGrantFlight = null
+              rpcGrantController = null
+            }
+          }
+          })()
+          rpcGrantFlight = flight
+        }
+        const current = flight
+        const waiter = {}
+        current.waiters.add(waiter)
+        return new Promise((resolve, reject) => {
+          let settled = false
+          const finish = (fn, value) => {
+            if (settled) return
+            settled = true
+            signal?.removeEventListener?.('abort', onAbort)
+            current.waiters.delete(waiter)
+            if (current.waiters.size === 0 && rpcGrantFlight === current) {
+              current.controller?.abort()
+              rpcGrantFlight = null
+              rpcGrantController = null
+              rpcGrantGeneration += 1
+            }
+            fn(value)
+          }
+          const onAbort = () => finish(reject, abortError())
+          signal?.addEventListener?.('abort', onAbort, { once: true })
+          if (signal?.aborted) { onAbort(); return }
+          current.promise.then(value => finish(resolve, value), error => finish(reject, error))
+        })
+      }
+
+      return { refresh, snapshot, getSnapshot, subscribe(listener) { if (disposed) return () => {}; listeners.add(listener); return () => listeners.delete(listener) }, noteRedirect, invalidate, dispose, requestRpcGrant, get version() { return version } }
     }
 
-    async function api(path, options) {
-      const timeout = new AbortController()
-      const timer = setTimeout(() => timeout.abort(), 5000)
-      const onAbort = () => timeout.abort()
-      if (options?.signal) {
-        if (options.signal.aborted) timeout.abort()
-        else options.signal.addEventListener('abort', onAbort)
-      }
-      try {
-        const res = await fetch(API + path, {
-          credentials: 'same-origin',
-          headers: { 'content-type': 'application/json', ...(options?.headers || {}) },
-          ...options,
-          signal: timeout.signal,
-        })
-        const text = await res.text()
-        let data = {}
-        try { data = text ? JSON.parse(text) : {} } catch {
-          throw Object.assign(new Error('invalid_json'), { status: res.status })
-        }
-        if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, code: data.code })
-        return data
-      } catch (error) {
-        if (error?.name === 'AbortError') throw Object.assign(new Error('timeout'), { name: 'TimeoutError' })
-        throw error
-      } finally {
-        clearTimeout(timer)
-        options?.signal?.removeEventListener?.('abort', onAbort)
-      }
+    const listeners = new Set()
+    let session = null
+    const state = { me: null, loading: true, auth: null }
+    function emit() { for (const fn of listeners) fn({ ...state }) }
+    function setState(patch) { Object.assign(state, patch); emit() }
+    function publishSession() {
+      const auth = session.snapshot()
+      setState({ me: auth.me, loading: auth.loading, auth })
     }
+
+    const api = createAuthRequest({ fetchImpl: (...args) => fetch(...args), base: API, origin: window.location?.origin })
 
     async function refreshMe() {
       return session.refresh()
@@ -365,7 +537,15 @@ window.__ModuleLoader__.load({
     }
 
     function AuthOverlay({ setup, children }) {
-      return jsxs('div', { 'data-lha-overlay': '', children: [
+      const ref = React.useRef(null)
+      React.useEffect(() => {
+        let second = 0
+        const first = window.requestAnimationFrame?.(() => { second = window.requestAnimationFrame(() => {
+          if (ref.current) { try { window.HanApp?.postMessage?.(JSON.stringify({ version: 1, id: 'hanaccount-ready', type: 'pageReady', payload: {} })) } catch {} }
+        }) })
+        return () => { window.cancelAnimationFrame?.(first); window.cancelAnimationFrame?.(second) }
+      }, [])
+      return jsxs('div', { ref, 'data-lha-overlay': '', children: [
         jsx('div', { 'data-lha-mask': '' }),
         jsx('div', { 'data-lha-dialog': '', 'data-lha-setup': setup ? '' : undefined, children }),
       ] })
@@ -380,7 +560,7 @@ window.__ModuleLoader__.load({
           .catch(() => {})
       }, [])
       return jsxs('div', { 'data-lha-content': '', children: [
-        jsx('p', { 'data-lha-wordmark': '', children: 'DEEPSEEK HARNESS' }),
+        jsx('p', { 'data-lha-wordmark': '', children: 'DSHA' }),
         jsx('h2', { 'data-lha-title': '', children: 'Nginx 配置错误' }),
         jsx('p', { 'data-lha-desc': '', children: `Host: ${info.host || '—'}` }),
         jsxs('div', { 'data-lha-body': '', children: [
@@ -871,9 +1051,9 @@ window.__ModuleLoader__.load({
       } else if (allowExact) {
         ipStatusTag = jsx('span', { className: 'dsh-lha-tag dsh-lha-tag--success', children: '在白名单' })
       } else if (ipLimitOn) {
-        ipStatusTag = jsx('span', { className: 'dsh-lha-tag dsh-lha-tag--warn', children: '未进白名单' })
+        ipStatusTag = jsx('span', { className: 'dsh-lha-tag dsh-lha-tag--muted', children: '默认（需登录）' })
       } else {
-        ipStatusTag = jsx('span', { className: 'dsh-lha-tag dsh-lha-tag--muted', children: 'IP 限制已关' })
+        ipStatusTag = jsx('span', { className: 'dsh-lha-tag dsh-lha-tag--muted', children: '白名单免登录已关' })
       }
 
       function renderSettingsGuide() {
@@ -891,13 +1071,14 @@ window.__ModuleLoader__.load({
                 jsx('p', { children: '本插件为 DSH Web 提供访问门禁：IP 名单、登录密码、Passkey，以及可选的 Nginx 反代与脚本 API 密钥。所有插件 API 默认受保护。' }),
               ] }),
               jsxs('div', { className: 'dsh-lha-guide-block', children: [
-                jsx('h4', { children: 'IP 限制与白黑名单' }),
+                jsx('h4', { children: 'IP 黑白名单' }),
                 jsx('p', { children: ipLimitOn
-                  ? '当前已开启 IP 限制：仅白名单内的 IP 可通过 IP 门禁；黑名单一律 403。关闭后仍需密码/Passkey，但不按名单拦截 IP。'
-                  : '当前 IP 限制已关闭：不按名单拦截，但仍需密码或 Passkey 登录。' }),
+                  ? '当前已开启 IP 名单：白名单免登录；黑名单拒绝（403）；其余默认 IP 显示登录页。'
+                  : '当前白名单免登录已关闭：黑名单仍拒绝；其余 IP 一律需密码或 Passkey 登录。' }),
                 jsx('ul', { children: [
-                  jsx('li', { children: '白名单：信任 IP 或 IPv4 CIDR（如 192.168.1.0/24），命中后直接过 IP 门禁。' }),
+                  jsx('li', { children: '白名单：信任 IP 或 IPv4 CIDR（如 192.168.1.0/24），命中后视为已认证（免登录）。' }),
                   jsx('li', { children: '黑名单：禁止 IP/CIDR，命中返回 403。与白名单互斥，加黑会自动移出白名单。' }),
+                  jsx('li', { children: '默认 IP：不在黑白名单内时进入登录页，不再因未加白而 403。' }),
                   jsx('li', { children: '127.0.0.1 / ::1 为系统保留，不可拉黑，不建议从白名单删除。' }),
                   isLoopback ? jsx('li', { children: '当前识别为回环地址：若经 Nginx 从外网访问，必须在反代中设置 proxy_set_header X-Real-IP $remote_addr;，否则无法识别真实客户端 IP。' }) : null,
                 ] }),
@@ -981,7 +1162,7 @@ window.__ModuleLoader__.load({
             ] }),
           ] }),
           jsx('label', { className: 'dsh-lha-checklbl', children: [
-            jsx('span', { children: 'IP 白名单限制' }),
+            jsx('span', { children: '白名单免登录' }),
             jsx('input', {
               type: 'checkbox',
               checked: ipLimitOn,
@@ -1162,16 +1343,35 @@ window.__ModuleLoader__.load({
         try {
           await api('/auth/logout', { method: 'POST', body: '{}' })
           try { window.localStorage.setItem('lha-auto-login-disabled', '1') } catch {}
+          session.invalidate('logout')
           window.location.replace('/')
         } catch { window.alert('退出失败，请重试。') }
       }, children: '退出访问控制' })
     }
 
     function apply(ctx) {
+      let adopted = false
+      try {
+        const holder = Object.getOwnPropertyDescriptor(window, '__HANACCOUNT_BOOTSTRAP_V1__')?.value
+        if (holder?.protocol === 1 && typeof holder.claim === 'function') {
+          const early = holder.claim()
+          if (early && typeof early.refresh === 'function' && typeof early.invalidate === 'function' && typeof early.dispose === 'function') {
+            session = early
+            adopted = true
+          }
+        }
+      } catch {}
+      if (!adopted) session = createAuthSession({ request: api })
+      const ownedSession = session
+      const authSnapshot = session.snapshot()
+      Object.assign(state, { me: authSnapshot.me, loading: authSnapshot.loading, auth: authSnapshot })
+      ownedSession.subscribe(publishSession)
       ensureStyle()
+      ctx.provide('hanaccountAuth', { getSnapshot: session.getSnapshot, subscribe: session.subscribe, refresh: session.refresh, invalidate: session.invalidate, requestRpcGrant: session.requestRpcGrant })
+      ctx.effect(() => () => { ownedSession.dispose(); listeners.clear() }, 'hanaccount: auth lifecycle')
       ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'dsh-local-hanaccount-gate', order: -1000 }, LoginGate)), 'dsh-local-hanaccount: gate')
       ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({ name: 'settings.section', id: 'dsh-local-hanaccount-settings', order: 15, label: '访问控制' }, GateSettingsSection)), 'dsh-local-hanaccount: settings')
-      refreshMe()
+      if (!adopted) refreshMe()
     }
 
     exports.apply = apply

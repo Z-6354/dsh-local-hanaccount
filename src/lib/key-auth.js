@@ -1,4 +1,4 @@
-import { createPublicKey, createVerify, randomBytes } from 'node:crypto'
+import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto'
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { id, nowIso } from './util.js'
@@ -13,13 +13,21 @@ function parseSshEd25519(line) {
   return { key, comment, line: line.trim() }
 }
 
+/**
+ * Stable id derived from the key bytes. Keys are re-read from disk on every request, so a random id changed on each
+ * load and `DELETE keys/:id` (which reloads the file) never matched anything: a key could not be revoked.
+ */
+export function keyId(publicKey32) {
+  return 'key_' + createHash('sha256').update(publicKey32).digest('hex').slice(0, 24)
+}
+
 export function parseAuthorizedKeys(text) {
   const keys = []
   for (const line of String(text || '').split('\n')) {
     const trimmed = line.trim()
     if (!trimmed || trimmed.startsWith('#')) continue
     const parsed = parseSshEd25519(trimmed)
-    if (parsed) keys.push({ id: id('key'), ...parsed })
+    if (parsed) keys.push({ id: keyId(parsed.key), ...parsed })
   }
   return keys
 }
@@ -67,7 +75,9 @@ export function verifyEd25519Signature(publicKey32, message, signature) {
       publicKey32,
     ])
     const key = createPublicKey({ key: der, format: 'der', type: 'spki' })
-    return createVerify('ed25519').update(message).verify(key, signature)
+    // Ed25519 is one-shot: createVerify('ed25519') throws "Invalid digest", which the catch turned into `false`,
+    // so no valid signature could ever log in. crypto.verify with a null algorithm is the supported form.
+    return verify(null, message, key, signature)
   } catch {
     return false
   }
@@ -85,5 +95,5 @@ export function addPublicKey(keys, line) {
   const parsed = parseSshEd25519(line)
   if (!parsed) throw new Error('invalid ssh-ed25519 public key')
   if (keys.some((k) => k.line === parsed.line)) return keys
-  return [...keys, { id: id('key'), ...parsed, addedAt: nowIso() }]
+  return [...keys, { id: keyId(parsed.key), ...parsed, addedAt: nowIso() }]
 }

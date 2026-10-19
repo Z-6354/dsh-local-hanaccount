@@ -9,7 +9,8 @@ import {
   sendJson,
   setCookieHeader,
 } from './lib/util.js'
-import { hashPassword, verifyPassword, checkLockout, recordFailedAttempt, resetLockout } from './lib/password.js'
+import { hashPassword, verifyPasswordAsync, checkLockout, recordFailedAttempt, resetLockout } from './lib/password.js'
+import { createLoginGuard } from './lib/login-guard.js'
 import {
   addPublicKey,
   createChallengeStore,
@@ -17,7 +18,7 @@ import {
   saveAuthorizedKeys,
   verifyKeySignature,
 } from './lib/key-auth.js'
-import { isLoopbackIp, requestHost, detectNginxMisconfig, detectProxy, nginxSnippet, applyIpListChange } from './lib/ip.js'
+import { detectNginxMisconfig, detectProxy, nginxSnippet, applyIpListChange } from './lib/ip.js'
 import { passkeyStatus } from './lib/passkey-context.js'
 import {
   authenticationOptions,
@@ -26,7 +27,7 @@ import {
   verifyRegistration,
 } from './lib/passkey.js'
 
-export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAuthentication, securityState, isCurrent = () => true, onSecurityFailure }) {
+export function createApiHandler({ store, gate, bridge, rpcAuthorization, verifyPasskey = verifyAuthentication, securityState, isCurrent = () => true, onSecurityFailure, loginGuard = createLoginGuard() }) {
   const challenges = createChallengeStore()
   const pairFailures = new Map()
   const PAIR_FAIL_LIMIT = 10
@@ -159,9 +160,12 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       if (req.method === 'GET' && sub === 'auth/me') {
         const token = authToken(req)
         const session = store.cfg.passwordHash ? store.sessionFromToken(token) : null
+        const nativeAuthenticated = bridge ? bridge.authenticated(req) : false
+        const resumeScope = session && nativeAuthenticated ? store.resumeScope(token) : undefined
         sendJson(res, 200, {
           authenticated: !!session,
-          nativeAuthenticated: bridge ? bridge.authenticated(req) : false,
+          nativeAuthenticated,
+          ...(resumeScope ? { resumeScope } : {}),
           protocol: AUTH_PROTOCOL,
           passwordConfigured: !!store.cfg.passwordHash,
           ip: meta.ip,
@@ -199,24 +203,11 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       }
 
       if (req.method === 'POST' && sub === 'auth/setup') {
-        const localHost = ['localhost', '127.0.0.1', '::1'].includes(requestHost(req))
-        let sameOrigin = true
-        if (req.headers?.origin) {
-          try { sameOrigin = new URL(req.headers.origin).host === req.headers.host } catch { sameOrigin = false }
-        }
-        if (!isLoopbackIp(req.socket?.remoteAddress) || !localHost || !sameOrigin || detectProxy(req).hasForwardedHeaders) {
-          sendJson(res, 403, { error: 'setup requires direct loopback' }); return
-        }
-        if (store.cfg.passwordHash) {
-          sendJson(res, 400, { error: 'password already configured' })
-          return
-        }
-        const body = await readOperationBody()
-        const password = String(body.password ?? '')
-        if (store.cfg.passwordHash) throw httpError(409, 'password already configured')
-        if (password.length < 8) throw httpError(400, 'password must be at least 8 characters')
-        store.setPasswordHash(hashPassword(password))
-        grant(req, res)
+        // Closed on purpose. A loopback peer cannot be told apart from a tunnel (frp, ssh -R, ...) that terminates on
+        // this machine, so "first visitor sets the password" lets whoever reaches the port first take the instance.
+        // The initial password comes from the process environment or `scripts/set-password.mjs`, as in code-server and
+        // Portainer. No body is read and nothing is written.
+        sendJson(res, 403, { error: 'setup_disabled', code: 'setup_disabled' })
         return
       }
 
@@ -235,9 +226,36 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
         const body = await readOperationBody()
         const password = String(body.password ?? '')
         if (store.cfg.passwordHash !== loginVersion) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
-        if (!verifyPassword(password, store.cfg.passwordHash)) {
-          const fail = recordFailedAttempt(lockout, ip, store.cfg.lockout)
-          if (!whitelisted) gate.recordIfSuspicious(ip, fail.reason, req, { whitelisted })
+        // The first lockout check ran before an await, so N concurrent requests all passed it. Re-check here: from this
+        // point verifyPassword + recordFailedAttempt run synchronously, so concurrent attempts are counted one by one.
+        const relock = checkLockout(lockout, store.cfg.lockout)
+        if (relock.locked) {
+          sendJson(res, 429, { error: 'rate_limited', code: 'rate_limited', retryAfterSec: relock.retryAfterSec })
+          return
+        }
+        // Global cooldown above the per-address lockout: a guesser spread over many IPv4 addresses gets 5 tries each,
+        // so total failures are budgeted too. Allow-listed addresses are exempt.
+        const global = whitelisted ? { ok: true } : loginGuard.check()
+        if (!global.ok) {
+          sendJson(res, 429, { error: 'rate_limited', code: 'rate_limited', retryAfterSec: global.retryAfterSec })
+          return
+        }
+        // Password verification is asynchronous (scrypt on the thread pool, so the event loop keeps serving), which
+        // means concurrent attempts no longer run one after another. Reserve the attempt NOW, synchronously, so N
+        // parallel requests are counted N times and cannot all slip past the lockout; success refunds it below.
+        const before = { attempts: lockout.attempts, lockedUntil: lockout.lockedUntil, lastAttemptAt: lockout.lastAttemptAt }
+        const reserved = recordFailedAttempt(lockout, ip, store.cfg.lockout)
+        let verified
+        try { verified = await loginGuard.run(() => verifyPasswordAsync(password, store.cfg.passwordHash)) }
+        catch (error) {
+          if (error?.code === 'login_busy') Object.assign(lockout, before) // never executed: do not charge the client
+          throw error
+        }
+        revalidate()
+        if (store.cfg.passwordHash !== loginVersion) throw Object.assign(new Error('identity_revoked'), {status:401, code:'identity_revoked'})
+        if (!verified) {
+          if (!whitelisted) loginGuard.recordFailure()
+          if (!whitelisted) gate.recordIfSuspicious(ip, reserved.reason, req, { whitelisted })
           store.saveState()
           sendJson(res, 401, { error: 'invalid_password', code: 'invalid_password' })
           return
@@ -317,6 +335,16 @@ export function createApiHandler({ store, gate, bridge, verifyPasskey = verifyAu
       if (!token) return
       authenticatedToken = token
       revalidate()
+
+      if (req.method === 'POST' && sub === 'auth/rpc-grant') {
+        const body = await readOperationBody()
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length) throw httpError(400, 'empty request required')
+        const lease = rpcAuthorization?.issueForRequest(req)
+        if (!lease) throw Object.assign(new Error('rpc_authorization_unavailable'), {status:503, code:'rpc_authorization_unavailable'})
+        revalidate()
+        sendJson(res, 200, lease, {'cache-control':'no-store'})
+        return
+      }
 
       if (req.method === 'GET' && sub === 'config') {
         sendJson(res, 200, store.publicConfig())

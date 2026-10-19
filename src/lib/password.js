@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto'
+import { randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto'
 
 const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 }
 
@@ -19,6 +19,26 @@ export function verifyPassword(password, encoded) {
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
 
+/**
+ * Non-blocking verification: scrypt runs on the libuv thread pool, so a burst of login attempts cannot freeze the
+ * event loop (and with it every other request, WebSocket and the DSH UI). The synchronous variant stays for callers
+ * that are already serialized.
+ */
+export function verifyPasswordAsync(password, encoded) {
+  const s = String(encoded || '')
+  if (!s.startsWith('$scrypt$')) return Promise.resolve(false)
+  const parts = s.split('$')
+  if (parts.length !== 4) return Promise.resolve(false)
+  const salt = Buffer.from(parts[2], 'base64')
+  const expected = Buffer.from(parts[3], 'base64')
+  return new Promise((resolve, reject) => {
+    scrypt(String(password), salt, expected.length, SCRYPT_PARAMS, (error, actual) => {
+      if (error) reject(error)
+      else resolve(expected.length === actual.length && timingSafeEqual(expected, actual))
+    })
+  })
+}
+
 export function createLockoutState() {
   return { attempts: 0, lockedUntil: 0 }
 }
@@ -37,6 +57,7 @@ export function checkLockout(lockout, { maxAttempts = 5, lockMinutes = 30 } = {}
 
 export function recordFailedAttempt(lockout, ip, { maxAttempts = 5, lockMinutes = 30 } = {}) {
   lockout.attempts = (lockout.attempts || 0) + 1
+  lockout.lastAttemptAt = Date.now()
   if (lockout.attempts >= maxAttempts) {
     lockout.lockedUntil = Date.now() + lockMinutes * 60 * 1000
     return { locked: true, reason: 'lockout' }

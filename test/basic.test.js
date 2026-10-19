@@ -27,8 +27,14 @@ test('ip whitelist and blacklist evaluation', () => {
   assert.equal(evaluateIpAccess('10.0.0.1', cfg).action, 'block')
   assert.equal(evaluateIpAccess('10.0.0.1', cfg).reason, 'ip_blacklisted')
   assert.equal(evaluateIpAccess('127.0.0.1', cfg).action, 'pass')
-  assert.equal(evaluateIpAccess('203.0.113.50', cfg).action, 'block')
+  // Loopback is indistinguishable from a tunnel terminating here, so 免登录 needs explicit `loopbackOperator`.
+  assert.equal(evaluateIpAccess('127.0.0.1', cfg).whitelisted, false)
+  assert.equal(evaluateIpAccess('127.0.0.1', { ...cfg, loopbackOperator: true }).whitelisted, true)
+  // Default IPs pass the IP gate and go to login — they are not blocked.
+  assert.equal(evaluateIpAccess('203.0.113.50', cfg).action, 'pass')
+  assert.equal(evaluateIpAccess('203.0.113.50', cfg).whitelisted, false)
   assert.equal(evaluateIpAccess('203.0.113.50', { ...cfg, ipLimitEnabled: false }).action, 'pass')
+  assert.equal(evaluateIpAccess('127.0.0.1', { ...cfg, ipLimitEnabled: false }).whitelisted, false)
 })
 
 test('cidr matching', () => {
@@ -146,7 +152,7 @@ test('lockout after failed attempts', () => {
   assert.equal(status.locked, true)
 })
 
-test('gate blocks non-whitelisted ip on api path', () => {
+test('gate lets default (non-whitelist) ip through IP gate', () => {
   const dir = mkdtempSync(join(tmpdir(), 'lha-v2-'))
   try {
     const store = createStore({ dataDir: dir, allow: ['127.0.0.1'] })
@@ -162,8 +168,10 @@ test('gate blocks non-whitelisted ip on api path', () => {
       end() {},
     }
     const result = gate.checkIpGate(req, res)
-    assert.equal(result, true)
-    assert.equal(statusCode, 403)
+    assert.notEqual(result, true)
+    assert.equal(result.whitelisted, false)
+    assert.equal(result.ip, '203.0.113.50')
+    assert.equal(statusCode, 0)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -385,7 +393,8 @@ test('excluded prefix skips auth but keeps ip gate', () => {
       end() {},
     }
     gate.wrapHttpHandler(() => { statusCode = 200 })(req, res)
-    assert.equal(statusCode, 403)
+    // Default IP reaches auth gate → 401 (not IP-blocked 403).
+    assert.equal(statusCode, 401)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
